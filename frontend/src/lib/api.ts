@@ -12,7 +12,7 @@ import type {
 } from "@/types";
 
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_URL || "https://stock-intelligence-api-tkkf.onrender.com";
 
 const api = axios.create({
   baseURL: `${API_BASE_URL}/api/v1`,
