@@ -10,7 +10,7 @@ python-multipart==0.0.9
 # Data
 yfinance==0.2.40
 pandas==2.2.2
-numpy==1.26.4
+numpy>=2.0,<3
 
 # AI/ML
 scikit-learn==1.5.0
@@ -21,4 +21,4 @@ vaderSentiment==3.3.2
 # Utilities
 cachetools==5.3.3
 python-dateutil==2.9.0.post0
-ta-lib==0.4.28
+ta-lib==0.6.4
