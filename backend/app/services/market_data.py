@@ -1,7 +1,10 @@
-import yfinance as yf
-import pandas as pd
-from typing import Optional, List, Dict, Any
+import asyncio
 import logging
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+
+import pandas as pd
+import yfinance as yf
 from cachetools import TTLCache
 
 from app.models.schemas import QuoteData, PricePoint, HistoricalData, TimeFrame
@@ -9,41 +12,26 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Caches
-# ---------------------------------------------------------------------------
-
+# Longer caches help prevent Yahoo rate limiting on Render.
 quote_cache = TTLCache(
     maxsize=100,
-    ttl=settings.cache_ttl_quote
+    ttl=max(getattr(settings, "cache_ttl_quote", 60), 120),
 )
 
 history_cache = TTLCache(
     maxsize=100,
-    ttl=300
+    ttl=600,
 )
 
 stats_cache = TTLCache(
     maxsize=100,
-    ttl=settings.cache_ttl_quote
+    ttl=600,
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _get_ticker(symbol: str) -> yf.Ticker:
-    """Create a yfinance ticker."""
-    return yf.Ticker(symbol.upper().strip())
-
-
 def _safe_get(info: dict, key: str, default=None):
-    """Safely retrieve a value from a yfinance dictionary."""
+    """Safely get a value from yfinance."""
     try:
-        if not info:
-            return default
-
         value = info.get(key, default)
 
         if value is None:
@@ -58,275 +46,205 @@ def _safe_get(info: dict, key: str, default=None):
         return default
 
 
-def _safe_float(value, default=0.0):
+def _to_float(value, default=0.0):
     """Safely convert a value to float."""
     try:
-        if value is None:
+        if value is None or pd.isna(value):
             return default
-
-        if isinstance(value, float) and pd.isna(value):
-            return default
-
         return float(value)
-
     except (TypeError, ValueError):
         return default
 
 
-def _safe_int(value, default=0):
+def _to_int(value, default=0):
     """Safely convert a value to int."""
     try:
-        if value is None:
+        if value is None or pd.isna(value):
             return default
-
-        if isinstance(value, float) and pd.isna(value):
-            return default
-
-        return int(value)
-
+        return int(float(value))
     except (TypeError, ValueError):
         return default
 
 
-# ---------------------------------------------------------------------------
-# Quote
-# ---------------------------------------------------------------------------
+async def _get_info_with_retry(symbol: str, retries: int = 3) -> dict:
+    """
+    Fetch ticker.info with retry/backoff.
+
+    Yahoo sometimes returns HTTP 429 when Render makes too many
+    requests. Waiting between attempts reduces the chance of
+    immediately hitting the rate limit again.
+    """
+    symbol = symbol.upper()
+
+    for attempt in range(retries):
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+
+            if isinstance(info, dict) and info:
+                return info
+
+            logger.warning(
+                "Yahoo returned empty info for %s (attempt %s/%s)",
+                symbol,
+                attempt + 1,
+                retries,
+            )
+
+        except Exception as e:
+            error_text = str(e).lower()
+
+            if "429" in error_text or "too many requests" in error_text:
+                logger.warning(
+                    "Yahoo rate limited %s (attempt %s/%s)",
+                    symbol,
+                    attempt + 1,
+                    retries,
+                )
+            else:
+                logger.warning(
+                    "Yahoo info request failed for %s (attempt %s/%s): %s",
+                    symbol,
+                    attempt + 1,
+                    retries,
+                    e,
+                )
+
+        if attempt < retries - 1:
+            await asyncio.sleep(2 * (attempt + 1))
+
+    return {}
+
+
+async def _get_history_with_retry(
+    symbol: str,
+    period: str,
+    interval: str,
+    retries: int = 3,
+) -> pd.DataFrame:
+    """Fetch historical data with retry/backoff."""
+    symbol = symbol.upper()
+
+    for attempt in range(retries):
+        try:
+            ticker = yf.Ticker(symbol)
+
+            hist = ticker.history(
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                actions=False,
+            )
+
+            if hist is not None and not hist.empty:
+                return hist
+
+            logger.warning(
+                "Yahoo returned empty history for %s (attempt %s/%s)",
+                symbol,
+                attempt + 1,
+                retries,
+            )
+
+        except Exception as e:
+            error_text = str(e).lower()
+
+            if "429" in error_text or "too many requests" in error_text:
+                logger.warning(
+                    "Yahoo rate limited historical request for %s",
+                    symbol,
+                )
+            else:
+                logger.warning(
+                    "Historical request failed for %s: %s",
+                    symbol,
+                    e,
+                )
+
+        if attempt < retries - 1:
+            await asyncio.sleep(2 * (attempt + 1))
+
+    return pd.DataFrame()
+
 
 async def get_quote(symbol: str) -> QuoteData:
-    """
-    Get current quote data.
-
-    Uses yfinance .info first and falls back to .fast_info when Yahoo
-    blocks the regular info endpoint.
-    """
-
-    symbol = symbol.upper().strip()
+    """Get current quote data safely."""
+    symbol = symbol.upper()
     cache_key = f"quote_{symbol}"
 
-    # Cache
+    # Return cached result first.
     if cache_key in quote_cache:
         return quote_cache[cache_key]
 
-    ticker = _get_ticker(symbol)
-
-    info = {}
-
-    # ---------------------------------------------------------------
-    # Try normal .info
-    # ---------------------------------------------------------------
-
     try:
-        info = ticker.info or {}
+        info = await _get_info_with_retry(symbol)
 
-    except Exception as e:
-        logger.warning(
-            f"Yahoo .info failed for {symbol}: {e}"
-        )
-
-    # ---------------------------------------------------------------
-    # Normal info succeeded
-    # ---------------------------------------------------------------
-
-    if info and "regularMarketPrice" in info:
-
-        try:
-            price = _safe_float(
-                _safe_get(info, "regularMarketPrice")
-            )
-
-            previous_close = _safe_float(
-                _safe_get(info, "regularMarketPreviousClose"),
-                price
-            )
-
-            change = _safe_float(
-                _safe_get(info, "regularMarketChange"),
-                price - previous_close
-            )
-
-            # Yahoo's regularMarketChangePercent is already a percentage.
-            change_percent = _safe_float(
-                _safe_get(info, "regularMarketChangePercent"),
-                (
-                    (change / previous_close) * 100
-                    if previous_close
-                    else 0
-                )
-            )
-
-            quote = QuoteData(
-                symbol=symbol,
-
-                name=_safe_get(
-                    info,
-                    "longName",
-                    symbol
-                ),
-
-                sector=_safe_get(
-                    info,
-                    "sector"
-                ),
-
-                industry=_safe_get(
-                    info,
-                    "industry"
-                ),
-
-                price=price,
-
-                change=change,
-
-                change_percent=change_percent,
-
-                volume=_safe_int(
-                    _safe_get(
-                        info,
-                        "regularMarketVolume",
-                        0
-                    )
-                ),
-
-                avg_volume=_safe_int(
-                    _safe_get(
-                        info,
-                        "averageVolume",
-                        0
-                    )
-                ),
-
-                market_cap=_safe_get(
-                    info,
-                    "marketCap"
-                ),
-
-                day_high=_safe_float(
-                    _safe_get(
-                        info,
-                        "regularMarketDayHigh",
-                        0
-                    )
-                ),
-
-                day_low=_safe_float(
-                    _safe_get(
-                        info,
-                        "regularMarketDayLow",
-                        0
-                    )
-                ),
-
-                year_high=_safe_float(
-                    _safe_get(
-                        info,
-                        "fiftyTwoWeekHigh",
-                        0
-                    )
-                ),
-
-                year_low=_safe_float(
-                    _safe_get(
-                        info,
-                        "fiftyTwoWeekLow",
-                        0
-                    )
-                ),
-
-                pe_ratio=_safe_get(
-                    info,
-                    "trailingPE"
-                ),
-
-                dividend_yield=_safe_get(
-                    info,
-                    "dividendYield"
-                ),
-            )
-
-            quote_cache[cache_key] = quote
-
-            return quote
-
-        except Exception as e:
-            logger.error(
-                f"Error creating quote from info for {symbol}: {e}"
-            )
-
-    # ---------------------------------------------------------------
-    # Fallback: fast_info
-    # ---------------------------------------------------------------
-
-    logger.warning(
-        f"Falling back to Yahoo fast_info for {symbol}"
-    )
-
-    try:
-        fast_info = ticker.fast_info
-
-        price = _safe_float(
-            fast_info.get("last_price", 0)
-        )
-
-        previous_close = _safe_float(
-            fast_info.get("previous_close", price),
-            price
-        )
-
-        change = price - previous_close
-
-        change_percent = (
-            (change / previous_close) * 100
-            if previous_close
-            else 0
-        )
-
-        if price <= 0:
+        if not info:
             raise ValueError(
-                f"No valid price returned for {symbol}"
+                f"Yahoo Finance temporarily unavailable for {symbol}. "
+                "Please try again in a moment."
             )
+
+        price = _safe_get(info, "regularMarketPrice")
+
+        # Some Yahoo responses don't contain regularMarketPrice.
+        # Try currentPrice as a fallback.
+        if price is None:
+            price = _safe_get(info, "currentPrice")
+
+        if price is None:
+            raise ValueError(f"No current price available for {symbol}")
+
+        change = _safe_get(
+            info,
+            "regularMarketChange",
+            _safe_get(info, "change", 0),
+        )
+
+        change_percent = _safe_get(
+            info,
+            "regularMarketChangePercent",
+            _safe_get(info, "changePercent", 0),
+        )
+
+        # yfinance generally returns this as a percentage already.
+        change_percent = _to_float(change_percent)
 
         quote = QuoteData(
             symbol=symbol,
+            name=_safe_get(info, "longName", symbol),
+            sector=_safe_get(info, "sector"),
+            industry=_safe_get(info, "industry"),
 
-            name=symbol,
-
-            sector=None,
-
-            industry=None,
-
-            price=price,
-
-            change=change,
-
+            price=_to_float(price),
+            change=_to_float(change),
             change_percent=change_percent,
 
-            volume=_safe_int(
-                fast_info.get("last_volume", 0)
+            volume=_to_int(
+                _safe_get(info, "regularMarketVolume", 0)
+            ),
+            avg_volume=_to_int(
+                _safe_get(info, "averageVolume", 0)
             ),
 
-            avg_volume=0,
+            market_cap=_safe_get(info, "marketCap"),
 
-            market_cap=None,
-
-            day_high=_safe_float(
-                fast_info.get("day_high", 0)
+            day_high=_to_float(
+                _safe_get(info, "regularMarketDayHigh", 0)
+            ),
+            day_low=_to_float(
+                _safe_get(info, "regularMarketDayLow", 0)
             ),
 
-            day_low=_safe_float(
-                fast_info.get("day_low", 0)
+            year_high=_to_float(
+                _safe_get(info, "fiftyTwoWeekHigh", 0)
+            ),
+            year_low=_to_float(
+                _safe_get(info, "fiftyTwoWeekLow", 0)
             ),
 
-            year_high=_safe_float(
-                fast_info.get("year_high", 0)
-            ),
-
-            year_low=_safe_float(
-                fast_info.get("year_low", 0)
-            ),
-
-            pe_ratio=None,
-
-            dividend_yield=None,
+            pe_ratio=_safe_get(info, "trailingPE"),
+            dividend_yield=_safe_get(info, "dividendYield"),
         )
 
         quote_cache[cache_key] = quote
@@ -335,188 +253,110 @@ async def get_quote(symbol: str) -> QuoteData:
 
     except Exception as e:
         logger.error(
-            f"Yahoo fast_info also failed for {symbol}: {e}"
+            "Error fetching quote for %s: %s",
+            symbol,
+            e,
         )
+        raise
 
-        raise ValueError(
-            f"Unable to fetch quote data for {symbol}. "
-            f"Yahoo Finance may be temporarily rate-limiting requests."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Historical data
-# ---------------------------------------------------------------------------
 
 async def get_historical(
     symbol: str,
     timeframe: TimeFrame = TimeFrame.MONTH,
-    period: Optional[str] = None
+    period: Optional[str] = None,
 ) -> HistoricalData:
-
-    symbol = symbol.upper().strip()
+    """Get historical price data safely."""
+    symbol = symbol.upper()
 
     cache_key = f"hist_{symbol}_{timeframe.value}"
 
     if cache_key in history_cache:
         return history_cache[cache_key]
 
+    period_map = {
+        TimeFrame.DAY: "1d",
+        TimeFrame.WEEK: "5d",
+        TimeFrame.MONTH: "1mo",
+        TimeFrame.THREE_MONTHS: "3mo",
+        TimeFrame.YEAR: "1y",
+    }
+
+    yf_period = period or period_map.get(timeframe, "1mo")
+
+    interval_map = {
+        "1d": "5m",
+        "5d": "15m",
+        "1mo": "1d",
+        "3mo": "1d",
+        "1y": "1d",
+    }
+
+    interval = interval_map.get(yf_period, "1d")
+
     try:
-
-        ticker = _get_ticker(symbol)
-
-        # -----------------------------------------------------------
-        # Period mapping
-        # -----------------------------------------------------------
-
-        period_map = {
-            TimeFrame.DAY: "1d",
-            TimeFrame.WEEK: "5d",
-            TimeFrame.MONTH: "1mo",
-            TimeFrame.THREE_MONTHS: "3mo",
-            TimeFrame.YEAR: "1y",
-        }
-
-        yf_period = period or period_map.get(
-            timeframe,
-            "1mo"
-        )
-
-        # -----------------------------------------------------------
-        # Interval mapping
-        # -----------------------------------------------------------
-
-        interval_map = {
-            "1d": "5m",
-            "5d": "15m",
-            "1mo": "1d",
-            "3mo": "1d",
-            "1y": "1d",
-        }
-
-        interval = interval_map.get(
+        hist = await _get_history_with_retry(
+            symbol,
             yf_period,
-            "1d"
+            interval,
         )
 
-        # -----------------------------------------------------------
-        # Fetch history
-        # -----------------------------------------------------------
-
-        try:
-            hist = ticker.history(
-                period=yf_period,
-                interval=interval,
-                auto_adjust=False
-            )
-
-        except Exception as e:
-            logger.error(
-                f"Yahoo historical request failed for {symbol}: {e}"
-            )
-            hist = pd.DataFrame()
-
-        # -----------------------------------------------------------
-        # If Yahoo gave us nothing, retry with a simpler request
-        # -----------------------------------------------------------
-
         if hist.empty:
-
+            # Try a safer daily fallback.
             logger.warning(
-                f"Retrying historical data for {symbol}"
+                "Primary history request failed for %s. "
+                "Trying daily fallback.",
+                symbol,
             )
 
-            try:
-
-                hist = ticker.history(
-                    period=yf_period,
-                    interval="1d",
-                    auto_adjust=False
-                )
-
-            except Exception as e:
-                logger.error(
-                    f"Historical retry failed for {symbol}: {e}"
-                )
-                hist = pd.DataFrame()
-
-        # -----------------------------------------------------------
-        # Still no data
-        # -----------------------------------------------------------
+            hist = await _get_history_with_retry(
+                symbol,
+                yf_period,
+                "1d",
+                retries=2,
+            )
 
         if hist.empty:
-
             raise ValueError(
-                f"No historical data available for {symbol}"
+                f"No historical data currently available for {symbol}"
             )
-
-        # -----------------------------------------------------------
-        # Convert dataframe to API objects
-        # -----------------------------------------------------------
 
         data_points: List[PricePoint] = []
 
         for idx, row in hist.iterrows():
-
             try:
-
                 timestamp = (
                     idx.to_pydatetime()
                     if hasattr(idx, "to_pydatetime")
                     else idx
                 )
 
-                open_price = _safe_float(
-                    row.get("Open")
-                )
-
-                high_price = _safe_float(
-                    row.get("High")
-                )
-
-                low_price = _safe_float(
-                    row.get("Low")
-                )
-
-                close_price = _safe_float(
-                    row.get("Close")
-                )
-
-                volume = _safe_int(
-                    row.get("Volume")
-                )
-
-                # Skip completely invalid rows
-                if close_price <= 0:
-                    continue
-
                 data_points.append(
                     PricePoint(
                         timestamp=timestamp,
-                        open=open_price,
-                        high=high_price,
-                        low=low_price,
-                        close=close_price,
-                        volume=volume
+                        open=_to_float(row.get("Open")),
+                        high=_to_float(row.get("High")),
+                        low=_to_float(row.get("Low")),
+                        close=_to_float(row.get("Close")),
+                        volume=_to_int(row.get("Volume")),
                     )
                 )
 
             except Exception as e:
-
                 logger.warning(
-                    f"Skipping invalid historical row for {symbol}: {e}"
+                    "Skipping invalid historical row for %s: %s",
+                    symbol,
+                    e,
                 )
 
         if not data_points:
-
             raise ValueError(
-                f"No valid historical data for {symbol}"
+                f"No usable historical data for {symbol}"
             )
 
         result = HistoricalData(
             symbol=symbol,
             timeframe=timeframe,
-            data=data_points
+            data=data_points,
         )
 
         history_cache[cache_key] = result
@@ -524,180 +364,129 @@ async def get_historical(
         return result
 
     except Exception as e:
-
         logger.error(
-            f"Error fetching historical for {symbol}: {e}"
+            "Error fetching historical for %s: %s",
+            symbol,
+            e,
         )
-
         raise
 
 
-# ---------------------------------------------------------------------------
-# Key statistics
-# ---------------------------------------------------------------------------
-
-async def get_key_stats(
-    symbol: str
-) -> Dict[str, Any]:
-
-    symbol = symbol.upper().strip()
-
+async def get_key_stats(symbol: str) -> Dict[str, Any]:
+    """Get key statistics for health scoring."""
+    symbol = symbol.upper()
     cache_key = f"stats_{symbol}"
 
     if cache_key in stats_cache:
         return stats_cache[cache_key]
 
     try:
-
-        ticker = _get_ticker(symbol)
-
-        try:
-            info = ticker.info or {}
-
-        except Exception as e:
-
-            logger.warning(
-                f"Yahoo info failed while fetching stats for {symbol}: {e}"
-            )
-
-            info = {}
-
-        # If Yahoo is rate limiting us, return an empty dictionary
-        # instead of causing the health-score endpoint to crash.
+        info = await _get_info_with_retry(symbol)
 
         if not info:
-
             logger.warning(
-                f"No statistics available for {symbol}"
+                "No statistics available for %s",
+                symbol,
             )
-
             return {}
 
         stats = {
-
-            "beta": _safe_get(
-                info,
-                "beta"
-            ),
-
+            "beta": _safe_get(info, "beta"),
             "shares_outstanding": _safe_get(
                 info,
-                "sharesOutstanding"
+                "sharesOutstanding",
             ),
-
             "float_shares": _safe_get(
                 info,
-                "floatShares"
+                "floatShares",
             ),
-
             "short_ratio": _safe_get(
                 info,
-                "shortRatio"
+                "shortRatio",
             ),
-
             "short_percent": _safe_get(
                 info,
-                "shortPercentOfFloat"
+                "shortPercentOfFloat",
             ),
-
             "held_insiders": _safe_get(
                 info,
-                "heldPercentInsiders"
+                "heldPercentInsiders",
             ),
-
             "held_institutions": _safe_get(
                 info,
-                "heldPercentInstitutions"
+                "heldPercentInstitutions",
             ),
-
             "book_value": _safe_get(
                 info,
-                "bookValue"
+                "bookValue",
             ),
-
             "price_to_book": _safe_get(
                 info,
-                "priceToBook"
+                "priceToBook",
             ),
-
             "enterprise_value": _safe_get(
                 info,
-                "enterpriseValue"
+                "enterpriseValue",
             ),
-
             "ev_to_revenue": _safe_get(
                 info,
-                "enterpriseToRevenue"
+                "enterpriseToRevenue",
             ),
-
             "ev_to_ebitda": _safe_get(
                 info,
-                "enterpriseToEbitda"
+                "enterpriseToEbitda",
             ),
-
             "profit_margins": _safe_get(
                 info,
-                "profitMargins"
+                "profitMargins",
             ),
-
             "operating_margins": _safe_get(
                 info,
-                "operatingMargins"
+                "operatingMargins",
             ),
-
             "return_on_equity": _safe_get(
                 info,
-                "returnOnEquity"
+                "returnOnEquity",
             ),
-
             "return_on_assets": _safe_get(
                 info,
-                "returnOnAssets"
+                "returnOnAssets",
             ),
-
             "revenue_growth": _safe_get(
                 info,
-                "revenueGrowth"
+                "revenueGrowth",
             ),
-
             "earnings_growth": _safe_get(
                 info,
-                "earningsGrowth"
+                "earningsGrowth",
             ),
-
             "current_ratio": _safe_get(
                 info,
-                "currentRatio"
+                "currentRatio",
             ),
-
             "quick_ratio": _safe_get(
                 info,
-                "quickRatio"
+                "quickRatio",
             ),
-
             "debt_to_equity": _safe_get(
                 info,
-                "debtToEquity"
+                "debtToEquity",
             ),
-
             "total_cash": _safe_get(
                 info,
-                "totalCash"
+                "totalCash",
             ),
-
             "total_debt": _safe_get(
                 info,
-                "totalDebt"
+                "totalDebt",
             ),
-
             "operating_cash_flow": _safe_get(
                 info,
-                "operatingCashflow"
+                "operatingCashflow",
             ),
-
             "free_cash_flow": _safe_get(
                 info,
-                "freeCashflow"
+                "freeCashflow",
             ),
         }
 
@@ -706,106 +495,85 @@ async def get_key_stats(
         return stats
 
     except Exception as e:
-
         logger.error(
-            f"Error fetching key stats for {symbol}: {e}"
+            "Error fetching key stats for %s: %s",
+            symbol,
+            e,
         )
-
         return {}
 
 
-# ---------------------------------------------------------------------------
-# Search
-# ---------------------------------------------------------------------------
-
-async def search_tickers(
-    query: str
-) -> List[Dict[str, str]]:
-
+async def search_tickers(query: str) -> List[Dict[str, str]]:
+    """Search for stock tickers."""
     try:
-
-        query = query.strip()
-
-        if not query:
+        if not query or not query.strip():
             return []
 
         results = yf.Search(
-            query,
-            max_results=10
+            query.strip(),
+            max_results=10,
         )
 
         tickers = []
 
         for result in results.quotes:
-
-            try:
-
-                tickers.append(
-                    {
-                        "symbol": result.get(
-                            "symbol",
-                            ""
-                        ),
-
-                        "name": (
-                            result.get("longname")
-                            or result.get("shortname")
-                            or ""
-                        ),
-
-                        "exchange": result.get(
-                            "exchange",
-                            ""
-                        ),
-
-                        "type": result.get(
-                            "quoteType",
-                            ""
-                        ),
-                    }
-                )
-
-            except Exception:
-                continue
+            tickers.append(
+                {
+                    "symbol": result.get("symbol", ""),
+                    "name": (
+                        result.get("longname")
+                        or result.get("shortname")
+                        or ""
+                    ),
+                    "exchange": result.get(
+                        "exchange",
+                        "",
+                    ),
+                    "type": result.get(
+                        "quoteType",
+                        "",
+                    ),
+                }
+            )
 
         return tickers
 
     except Exception as e:
-
         logger.error(
-            f"Error searching tickers for {query}: {e}"
+            "Error searching tickers for %s: %s",
+            query,
+            e,
         )
-
         return []
 
 
-# ---------------------------------------------------------------------------
-# Multiple quotes
-# ---------------------------------------------------------------------------
-
 async def get_multiple_quotes(
-    symbols: List[str]
+    symbols: List[str],
 ) -> Dict[str, QuoteData]:
-
+    """Get quotes for multiple symbols."""
     results: Dict[str, QuoteData] = {}
 
+    # Sequential requests are intentional here.
+    # Parallel requests can trigger Yahoo's rate limiter.
     for symbol in symbols:
-
-        symbol = symbol.upper().strip()
-
-        if not symbol:
-            continue
-
         try:
+            clean_symbol = symbol.upper().strip()
 
-            results[symbol] = await get_quote(
-                symbol
+            if not clean_symbol:
+                continue
+
+            results[clean_symbol] = await get_quote(
+                clean_symbol
             )
 
-        except Exception as e:
+            # Small delay between uncached requests.
+            await asyncio.sleep(0.25)
 
+        except Exception as e:
             logger.warning(
-                f"Failed to get quote for {symbol}: {e}"
+                "Failed to get quote for %s: %s",
+                symbol,
+                e,
             )
 
     return results
