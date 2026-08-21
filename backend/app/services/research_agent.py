@@ -1,579 +1,561 @@
 """
-AI Research Agent
-Generates investment thesis using RAG + local rule-based synthesis.
-Works without any API keys - uses quantitative data and rules for thesis generation.
+Stock Health Scoring Engine
+Calculates health scores from quantitative metrics.
+No LLM involvement - purely data-driven.
 """
-import json
-import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import logging
+import numpy as np
 
-from app.ml.vector_store import retrieve_relevant_docs, store_financial_documents
-from app.services.market_data import get_quote, get_key_stats
-from app.services.financial_data import get_fundamentals, get_quarterly_financials
+from app.services.market_data import get_quote, get_key_stats, get_historical, TimeFrame
+from app.services.financial_data import get_fundamentals
 from app.services.news_service import get_news_with_sentiment
-from app.ml.health_scorer import calculate_health_score
-from app.ml.anomaly_detector import analyze_movement
-from app.models.schemas import (
-    ResearchReport, InvestmentThesis, ResearchSection, SourceDocument
-)
+from app.models.schemas import HealthSubScore, HealthScoreResponse
 
 logger = logging.getLogger(__name__)
 
 
-def _build_research_context(symbol: str, fundamentals, quote, stats, news, health, movement) -> str:
-    """Build comprehensive context for LLM."""
-    context_parts = []
-
-    # Company Overview
-    context_parts.append(f"=== COMPANY OVERVIEW ===")
-    context_parts.append(f"Symbol: {symbol.upper()}")
-    context_parts.append(f"Company: {fundamentals.company_name}")
-    context_parts.append(f"Sector: {fundamentals.sector}")
-    context_parts.append(f"Industry: {fundamentals.industry}")
-    context_parts.append(f"Current Price: ${quote.price:.2f} ({quote.change_percent:+.2f}%)")
-    context_parts.append(f"Market Cap: ${fundamentals.market_cap/1e9:.1f}B" if fundamentals.market_cap else "Market Cap: N/A")
-    context_parts.append("")
-
-    # Key Financial Metrics
-    context_parts.append("=== KEY FINANCIAL METRICS (TTM) ===")
-    if fundamentals.revenue:
-        context_parts.append(f"Revenue: ${fundamentals.revenue/1e9:.2f}B")
-    if fundamentals.revenue_growth_yoy:
-        context_parts.append(f"Revenue Growth YoY: {fundamentals.revenue_growth_yoy:+.1f}%")
-    if fundamentals.net_income:
-        context_parts.append(f"Net Income: ${fundamentals.net_income/1e9:.2f}B")
-    if fundamentals.net_margin:
-        context_parts.append(f"Net Margin: {fundamentals.net_margin:.1f}%")
-    if fundamentals.eps:
-        context_parts.append(f"EPS: ${fundamentals.eps:.2f}")
-    if fundamentals.eps_growth_yoy:
-        context_parts.append(f"EPS Growth YoY: {fundamentals.eps_growth_yoy:+.1f}%")
-    if fundamentals.free_cash_flow:
-        context_parts.append(f"Free Cash Flow: ${fundamentals.free_cash_flow/1e9:.2f}B")
-    if fundamentals.fcf_margin:
-        context_parts.append(f"FCF Margin: {fundamentals.fcf_margin:.1f}%")
-    if fundamentals.debt_to_equity:
-        context_parts.append(f"Debt-to-Equity: {fundamentals.debt_to_equity:.2f}")
-    if fundamentals.current_ratio:
-        context_parts.append(f"Current Ratio: {fundamentals.current_ratio:.2f}")
-    if fundamentals.roe:
-        context_parts.append(f"ROE: {fundamentals.roe:.1f}%")
-    if fundamentals.roa:
-        context_parts.append(f"ROA: {fundamentals.roa:.1f}%")
-    context_parts.append("")
-
-    # Valuation
-    context_parts.append("=== VALUATION ===")
-    if fundamentals.pe_ratio:
-        context_parts.append(f"P/E Ratio: {fundamentals.pe_ratio:.1f}")
-    if fundamentals.forward_pe:
-        context_parts.append(f"Forward P/E: {fundamentals.forward_pe:.1f}")
-    if fundamentals.peg_ratio:
-        context_parts.append(f"PEG Ratio: {fundamentals.peg_ratio:.1f}")
-    if fundamentals.ev_to_ebitda:
-        context_parts.append(f"EV/EBITDA: {fundamentals.ev_to_ebitda:.1f}")
-    if fundamentals.price_to_sales:
-        context_parts.append(f"P/S: {fundamentals.price_to_sales:.1f}")
-    if fundamentals.price_to_book:
-        context_parts.append(f"P/B: {fundamentals.price_to_book:.1f}")
-    context_parts.append("")
-
-    # Health Scores
-    context_parts.append("=== AI HEALTH SCORES ===")
-    context_parts.append(f"Overall: {health.overall_score}/100 ({health.overall_label})")
-    for sub in health.sub_scores:
-        context_parts.append(f"  {sub.name}: {sub.score}/100 ({sub.label}) - {sub.explanation}")
-    context_parts.append("")
-
-    # Movement Analysis
-    if movement and movement.is_anomaly:
-        context_parts.append("=== RECENT MOVEMENT ANALYSIS ===")
-        context_parts.append(f"Anomaly detected: {movement.price_change_percent:+.2f}% move")
-        context_parts.append(f"Summary: {movement.summary}")
-        for driver in movement.drivers[:3]:
-            context_parts.append(f"  - {driver.driver} ({driver.confidence}% confidence, {driver.category})")
-            for ev in driver.evidence[:2]:
-                context_parts.append(f"    Evidence: {ev}")
-        context_parts.append("")
-
-    # News Sentiment
-    context_parts.append("=== NEWS SENTIMENT ===")
-    context_parts.append(f"Overall: {news.overall_sentiment} (score: {news.sentiment_score:.2f})")
-    context_parts.append(f"Article count: {news.article_count}")
-    for article in news.articles[:5]:
-        context_parts.append(f"  - [{article.sentiment}] {article.title[:100]}")
-        context_parts.append(f"    Source: {article.source}, Date: {article.published_at.strftime('%Y-%m-%d')}")
-    context_parts.append("")
-
-    # Analyst Data
-    if fundamentals.analyst_rating or fundamentals.price_target:
-        context_parts.append("=== ANALYST DATA ===")
-        if fundamentals.analyst_rating:
-            context_parts.append(f"Consensus Rating: {fundamentals.analyst_rating}")
-        if fundamentals.price_target:
-            context_parts.append(f"Price Target: ${fundamentals.price_target:.2f}")
-        if fundamentals.num_analysts:
-            context_parts.append(f"Number of Analysts: {fundamentals.num_analysts}")
-        context_parts.append("")
-
-    # Key Stats
-    context_parts.append("=== KEY STATISTICS ===")
-    if stats.get('beta'):
-        context_parts.append(f"Beta: {stats['beta']:.2f}")
-    if stats.get('held_institutions'):
-        context_parts.append(f"Institutional Ownership: {stats['held_institutions']:.1f}%")
-    if stats.get('held_insiders'):
-        context_parts.append(f"Insider Ownership: {stats['held_insiders']:.1f}%")
-    if stats.get('short_percent'):
-        context_parts.append(f"Short Interest: {stats['short_percent']:.1f}%")
-
-    return "\n".join(context_parts)
+def _clamp(value: float, min_val: float = 0, max_val: float = 100) -> float:
+    """Clamp value to range."""
+    return max(min_val, min(max_val, value))
 
 
-def _generate_investment_thesis(symbol: str, fundamentals, quote, stats, news, health, movement) -> InvestmentThesis:
-    """Generate investment thesis from quantitative data and rules."""
-    bull_case = []
-    bear_case = []
-
-    # Revenue growth
-    if fundamentals.revenue_growth_yoy is not None:
-        if fundamentals.revenue_growth_yoy > 15:
-            bull_case.append(f"Exceptional revenue growth of {fundamentals.revenue_growth_yoy:.1f}% YoY [Source: Financials, Revenue Growth]")
-        elif fundamentals.revenue_growth_yoy > 5:
-            bull_case.append(f"Solid revenue growth of {fundamentals.revenue_growth_yoy:.1f}% YoY [Source: Financials, Revenue Growth]")
-        elif fundamentals.revenue_growth_yoy < 0:
-            bear_case.append(f"Declining revenue at {fundamentals.revenue_growth_yoy:.1f}% YoY [Source: Financials, Revenue Growth]")
-        elif fundamentals.revenue_growth_yoy < 5:
-            bear_case.append(f"Slow revenue growth of {fundamentals.revenue_growth_yoy:.1f}% YoY [Source: Financials, Revenue Growth]")
-
-    # Profitability
-    if fundamentals.net_margin is not None:
-        if fundamentals.net_margin > 20:
-            bull_case.append(f"High net margin of {fundamentals.net_margin:.1f}% indicates strong pricing power [Source: Financials, Net Margin]")
-        elif fundamentals.net_margin > 10:
-            bull_case.append(f"Healthy net margin of {fundamentals.net_margin:.1f}% [Source: Financials, Net Margin]")
-        elif fundamentals.net_margin < 0:
-            bear_case.append(f"Negative net margin of {fundamentals.net_margin:.1f}% - company is unprofitable [Source: Financials, Net Margin]")
-        elif fundamentals.net_margin < 5:
-            bear_case.append(f"Low net margin of {fundamentals.net_margin:.1f}% suggests thin profitability [Source: Financials, Net Margin]")
-
-    # Free cash flow
-    if fundamentals.free_cash_flow is not None:
-        if fundamentals.free_cash_flow > 0:
-            bull_case.append(f"Positive free cash flow of ${fundamentals.free_cash_flow/1e9:.1f}B supports reinvestment and returns [Source: Financials, FCF]")
-        else:
-            bear_case.append(f"Negative free cash flow of ${fundamentals.free_cash_flow/1e9:.1f}B requires external funding [Source: Financials, FCF]")
-
-    # Leverage
-    if fundamentals.debt_to_equity is not None:
-        if fundamentals.debt_to_equity < 0.5:
-            bull_case.append(f"Conservative leverage with debt-to-equity of {fundamentals.debt_to_equity:.2f} [Source: Financials, D/E]")
-        elif fundamentals.debt_to_equity < 1:
-            bull_case.append(f"Moderate leverage with debt-to-equity of {fundamentals.debt_to_equity:.2f} [Source: Financials, D/E]")
-        elif fundamentals.debt_to_equity > 2:
-            bear_case.append(f"High leverage with debt-to-equity of {fundamentals.debt_to_equity:.2f} increases financial risk [Source: Financials, D/E]")
-        elif fundamentals.debt_to_equity > 1:
-            bear_case.append(f"Elevated leverage with debt-to-equity of {fundamentals.debt_to_equity:.2f} [Source: Financials, D/E]")
-
-    # Valuation
-    if fundamentals.pe_ratio is not None:
-        if fundamentals.pe_ratio < 15:
-            bull_case.append(f"Attractive P/E ratio of {fundamentals.pe_ratio:.1f} below market average [Source: Valuation, P/E]")
-        elif fundamentals.pe_ratio > 40:
-            bear_case.append(f"Elevated P/E ratio of {fundamentals.pe_ratio:.1f} implies high growth expectations [Source: Valuation, P/E]")
-        elif fundamentals.pe_ratio > 25:
-            bear_case.append(f"Above-average P/E ratio of {fundamentals.pe_ratio:.1f} [Source: Valuation, P/E]")
-
-    # PEG ratio
-    if fundamentals.peg_ratio is not None:
-        if fundamentals.peg_ratio < 1:
-            bull_case.append(f"PEG ratio of {fundamentals.peg_ratio:.1f} suggests undervaluation relative to growth [Source: Valuation, PEG]")
-        elif fundamentals.peg_ratio > 2:
-            bear_case.append(f"PEG ratio of {fundamentals.peg_ratio:.1f} suggests overvaluation relative to growth [Source: Valuation, PEG]")
-
-    # Returns
-    if fundamentals.roe is not None:
-        if fundamentals.roe > 20:
-            bull_case.append(f"Excellent ROE of {fundamentals.roe:.1f}% indicates efficient capital allocation [Source: Financials, ROE]")
-        elif fundamentals.roe < 10:
-            bear_case.append(f"Below-average ROE of {fundamentals.roe:.1f}% [Source: Financials, ROE]")
-
-    # Current ratio
-    if fundamentals.current_ratio is not None:
-        if fundamentals.current_ratio < 1:
-            bear_case.append(f"Current ratio of {fundamentals.current_ratio:.2f} below 1.0 indicates potential liquidity concerns [Source: Financials, Current Ratio]")
-        elif fundamentals.current_ratio > 2:
-            bull_case.append(f"Strong liquidity with current ratio of {fundamentals.current_ratio:.2f} [Source: Financials, Current Ratio]")
-
-    # News sentiment
-    if news.sentiment_score is not None:
-        if news.sentiment_score > 0.3:
-            bull_case.append(f"Positive news sentiment ({news.overall_sentiment}) from recent coverage [Source: News Sentiment]")
-        elif news.sentiment_score < -0.3:
-            bear_case.append(f"Negative news sentiment ({news.overall_sentiment}) from recent coverage [Source: News Sentiment]")
-
-    # Health score
-    if health.overall_score >= 70:
-        bull_case.append(f"Strong overall health score of {health.overall_score}/100 ({health.overall_label}) [Source: AI Health Score]")
-    elif health.overall_score <= 40:
-        bear_case.append(f"Weak overall health score of {health.overall_score}/100 ({health.overall_label}) [Source: AI Health Score]")
-
-    # Movement
-    if movement and movement.is_anomaly:
-        if movement.price_change_percent > 5:
-            bull_case.append(f"Recent anomalous price surge of {movement.price_change_percent:+.1f}% detected [Source: Movement Analysis]")
-        elif movement.price_change_percent < -5:
-            bear_case.append(f"Recent anomalous price drop of {movement.price_change_percent:+.1f}% detected [Source: Movement Analysis]")
-
-    # Analyst data
-    if fundamentals.analyst_rating:
-        if 'buy' in fundamentals.analyst_rating.lower() or 'overweight' in fundamentals.analyst_rating.lower():
-            bull_case.append(f"Analyst consensus: {fundamentals.analyst_rating} with {fundamentals.num_analysts or 'multiple'} analysts [Source: Analyst Ratings]")
-        elif 'sell' in fundamentals.analyst_rating.lower() or 'underweight' in fundamentals.analyst_rating.lower():
-            bear_case.append(f"Analyst consensus: {fundamentals.analyst_rating} [Source: Analyst Ratings]")
-
-    if fundamentals.price_target and quote.price:
-        upside = (fundamentals.price_target - quote.price) / quote.price * 100
-        if upside > 20:
-            bull_case.append(f"Analyst price target implies {upside:.0f}% upside [Source: Analyst Price Target]")
-        elif upside < -10:
-            bear_case.append(f"Analyst price target implies {abs(upside):.0f}% downside [Source: Analyst Price Target]")
-
-    # Default cases
-    if not bull_case:
-        bull_case.append("Sufficient data unavailable for detailed bull case - monitor fundamentals")
-    if not bear_case:
-        bear_case.append("Sufficient data unavailable for detailed bear case - monitor fundamentals")
-
-    # Key catalysts
-    key_catalysts = [
-        "Next quarterly earnings report",
-        "Product/technology announcements",
-        "Macroeconomic data (interest rates, inflation)",
-    ]
-    if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 10:
-        key_catalysts.insert(1, "Continued revenue acceleration")
-    if movement and movement.is_anomaly:
-        key_catalysts.insert(0, f"Follow-through on recent {movement.price_change_percent:+.1f}% move")
-
-    # Key risks
-    key_risks = [
-        "Market volatility and sector rotation",
-        "Competitive pressure and technology disruption",
-        "Regulatory and geopolitical uncertainty",
-    ]
-    if fundamentals.debt_to_equity and fundamentals.debt_to_equity > 2:
-        key_risks.insert(0, "High leverage limits financial flexibility")
-    if fundamentals.pe_ratio and fundamentals.pe_ratio > 40:
-        key_risks.insert(1, "Valuation leaves little margin for error")
-    if news.sentiment_score and news.sentiment_score < -0.3:
-        key_risks.insert(0, "Negative news flow and sentiment")
-
-    # Recent developments
-    recent_developments = [
-        f"Current price: ${quote.price:.2f} ({quote.change_percent:+.2f}%) [Source: Market Data]",
-        f"Health score: {health.overall_score}/100 ({health.overall_label}) [Source: AI Health Score]",
-    ]
-    if news.articles:
-        recent_developments.append(f"Recent news: {news.articles[0].title[:80]}... [Source: {news.articles[0].source}]")
-    if movement and movement.is_anomaly:
-        recent_developments.append(f"Anomalous move: {movement.summary} [Source: Movement Analysis]")
-
-    # Watch items
-    watch_items = [
-        "Quarterly revenue and EPS growth trajectory",
-        "Gross and operating margin trends",
-        "Free cash flow generation and capital allocation",
-        "Competitive positioning and market share",
-        "Guidance and management commentary",
-    ]
-
-    return InvestmentThesis(
-        bull_case=bull_case[:5],
-        bear_case=bear_case[:5],
-        key_catalysts=key_catalysts[:4],
-        key_risks=key_risks[:4],
-        recent_developments=recent_developments[:3],
-        watch_items=watch_items[:4],
-    )
-
-
-def _generate_detailed_sections(symbol: str, fundamentals, quote, stats, news, health, movement) -> List[ResearchSection]:
-    """Generate detailed research sections from quantitative data."""
-    sections = []
-
-    # Business Overview
-    sections.append(ResearchSection(
-        title="Business Overview",
-        content=f"{fundamentals.company_name} operates in the {fundamentals.sector} sector, {fundamentals.industry} industry. "
-                f"The company generates revenue primarily through its core business operations. "
-                f"Current market capitalization is ${fundamentals.market_cap/1e9:.1f}B." if fundamentals.market_cap else "Market cap data unavailable.",
-        sources=["Company Profile", "Market Data", "Yahoo Finance"]
-    ))
-
-    # Financial Health Deep Dive
-    fcf_text = "positive" if fundamentals.free_cash_flow and fundamentals.free_cash_flow > 0 else "negative"
-    sections.append(ResearchSection(
-        title="Financial Health Deep Dive",
-        content=f"Profitability: Net margin of {fundamentals.net_margin:.1f}% with ROE of {fundamentals.roe:.1f}% and ROA of {fundamentals.roa:.1f}%. "
-                f"Cash generation: {fcf_text.capitalize()} free cash flow (${fundamentals.free_cash_flow/1e9:.1f}B) with FCF margin of {fundamentals.fcf_margin:.1f}%. "
-                f"Liquidity: Current ratio of {fundamentals.current_ratio:.2f}. "
-                f"Leverage: Debt-to-equity of {fundamentals.debt_to_equity:.2f}." if fundamentals.net_margin and fundamentals.roe and fundamentals.roa and fundamentals.free_cash_flow and fundamentals.fcf_margin and fundamentals.current_ratio and fundamentals.debt_to_equity
-                else "Key financial metrics partially unavailable.",
-        sources=["Income Statement", "Balance Sheet", "Cash Flow Statement", "Financial Ratios"]
-    ))
-
-    # Growth Analysis
-    sections.append(ResearchSection(
-        title="Growth Analysis",
-        content=f"Revenue growth (YoY): {fundamentals.revenue_growth_yoy:.1f}%. "
-                f"EPS growth (YoY): {fundamentals.eps_growth_yoy:.1f}%. "
-                f"The company's growth profile is {'accelerating' if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 15 else 'strong' if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 10 else 'moderate' if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 5 else 'slowing' if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 0 else 'contracting'}." if fundamentals.revenue_growth_yoy is not None
-                else "Growth data unavailable.",
-        sources=["Income Statement", "Analyst Estimates", "SEC Filings"]
-    ))
-
-    # Valuation Assessment
-    pe_text = f"Current P/E: {fundamentals.pe_ratio:.1f}" if fundamentals.pe_ratio else "P/E: N/A"
-    fwd_pe = f"Forward P/E: {fundamentals.forward_pe:.1f}" if fundamentals.forward_pe else ""
-    peg = f"PEG: {fundamentals.peg_ratio:.1f}" if fundamentals.peg_ratio else ""
-    ev_ebitda = f"EV/EBITDA: {fundamentals.ev_to_ebitda:.1f}" if fundamentals.ev_to_ebitda else ""
-    ps = f"P/S: {fundamentals.price_to_sales:.1f}" if fundamentals.price_to_sales else ""
-    pb = f"P/B: {fundamentals.price_to_book:.1f}" if fundamentals.price_to_book else ""
-
-    val_parts = [pe_text, fwd_pe, peg, ev_ebitda, ps, pb]
-    val_str = ", ".join([p for p in val_parts if p])
-
-    if fundamentals.pe_ratio:
-        if fundamentals.pe_ratio < 15:
-            assessment = "appears undervalued relative to historical norms"
-        elif fundamentals.pe_ratio < 25:
-            assessment = "appears reasonably valued"
-        elif fundamentals.pe_ratio < 40:
-            assessment = "appears richly valued"
-        else:
-            assessment = "appears significantly overvalued"
-        val_str += f". Valuation {assessment}."
-
-    sections.append(ResearchSection(
-        title="Valuation Assessment",
-        content=val_str if val_str else "Valuation data unavailable.",
-        sources=["Market Data", "Analyst Estimates", "Yahoo Finance"]
-    ))
-
-    # Competitive Position
-    margin_desc = "strong" if fundamentals.net_margin and fundamentals.net_margin > 20 else "moderate" if fundamentals.net_margin and fundamentals.net_margin > 10 else "weak" if fundamentals.net_margin and fundamentals.net_margin > 0 else "negative"
-    sections.append(ResearchSection(
-        title="Competitive Position",
-        content=f"Operates in {fundamentals.industry} with {margin_desc} profitability (net margin: {fundamentals.net_margin:.1f}%). "
-                f"ROE of {fundamentals.roe:.1f}% {'exceeds' if fundamentals.roe and fundamentals.roe > 15 else 'is below' if fundamentals.roe and fundamentals.roe < 10 else 'is near'} typical cost of capital. "
-                f"Market position assessment requires deeper competitive analysis including moat evaluation.",
-        sources=["Industry Reports", "Financial Statements", "Competitive Analysis"]
-    ))
-
-    # Risk Factors
-    beta = stats.get('beta', 'N/A')
-    short_pct = stats.get('short_percent', 'N/A')
-    inst_own = stats.get('held_institutions', 'N/A')
-
-    risk_items = []
-    if fundamentals.debt_to_equity and fundamentals.debt_to_equity > 2:
-        risk_items.append(f"High financial leverage (D/E: {fundamentals.debt_to_equity:.2f})")
-    if fundamentals.current_ratio and fundamentals.current_ratio < 1:
-        risk_items.append(f"Liquidity risk (Current ratio: {fundamentals.current_ratio:.2f})")
-    if fundamentals.pe_ratio and fundamentals.pe_ratio > 40:
-        risk_items.append(f"Valuation risk (P/E: {fundamentals.pe_ratio:.1f})")
-    if beta != 'N/A' and beta > 1.5:
-        risk_items.append(f"High market sensitivity (Beta: {beta:.2f})")
-    if short_pct != 'N/A' and short_pct > 5:
-        risk_items.append(f"Elevated short interest ({short_pct:.1f}% of float)")
-
-    if not risk_items:
-        risk_items = ["Standard market and sector risks apply"]
-
-    sections.append(ResearchSection(
-        title="Risk Factors",
-        content="Key risks: " + "; ".join(risk_items) + f". Additional risks include macroeconomic volatility, regulatory changes, competitive disruption, and execution risk. Institutional ownership: {inst_own}%. Short interest: {short_pct}%.",
-        sources=["Market Data", "Risk Metrics", "SEC Filings"]
-    ))
-
-    return sections
-
-
-def _create_fallback_report(symbol: str, fundamentals, quote, health) -> ResearchReport:
-    """Create a basic report when LLM is unavailable."""
-    # Build basic thesis from quantitative data
-    bull_case = []
-    bear_case = []
-
-    if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 10:
-        bull_case.append(f"Strong revenue growth of {fundamentals.revenue_growth_yoy:.1f}% YoY [Source: Financials, Revenue Growth]")
-    elif fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy < 0:
-        bear_case.append(f"Declining revenue at {fundamentals.revenue_growth_yoy:.1f}% YoY [Source: Financials, Revenue Growth]")
-
-    if fundamentals.free_cash_flow and fundamentals.free_cash_flow > 0:
-        bull_case.append(f"Positive free cash flow of ${fundamentals.free_cash_flow/1e9:.1f}B [Source: Financials, FCF]")
+def _get_score_label(score: int) -> tuple:
+    """Get label and color for score."""
+    if score >= 80:
+        return "Excellent", "green"
+    elif score >= 65:
+        return "Good", "green"
+    elif score >= 50:
+        return "Fair", "yellow"
+    elif score >= 35:
+        return "Weak", "red"
     else:
-        bear_case.append(f"Negative or minimal free cash flow [Source: Financials, FCF]")
+        return "Poor", "red"
 
-    if fundamentals.debt_to_equity and fundamentals.debt_to_equity < 1:
-        bull_case.append(f"Low leverage with debt-to-equity of {fundamentals.debt_to_equity:.2f} [Source: Financials, D/E]")
-    elif fundamentals.debt_to_equity and fundamentals.debt_to_equity > 2:
-        bear_case.append(f"High leverage with debt-to-equity of {fundamentals.debt_to_equity:.2f} [Source: Financials, D/E]")
 
-    if fundamentals.pe_ratio and fundamentals.pe_ratio > 50:
-        bear_case.append(f"Elevated P/E ratio of {fundamentals.pe_ratio:.1f} suggests high expectations [Source: Valuation, P/E]")
-    elif fundamentals.pe_ratio and fundamentals.pe_ratio < 15:
-        bull_case.append(f"Reasonable P/E ratio of {fundamentals.pe_ratio:.1f} [Source: Valuation, P/E]")
+def _calculate_financial_health(fundamentals) -> HealthSubScore:
+    """Calculate Financial Health score from balance sheet and cash flow."""
+    score_components = []
 
-    if not bull_case:
-        bull_case.append("Data insufficient for detailed bull case")
-    if not bear_case:
-        bear_case.append("Data insufficient for detailed bear case")
+    # 1. Debt-to-Equity (lower is better)
+    dte = fundamentals.debt_to_equity
+    if dte is not None:
+        if dte < 0.5:
+            dte_score = 95
+        elif dte < 1.0:
+            dte_score = 85
+        elif dte < 1.5:
+            dte_score = 70
+        elif dte < 2.0:
+            dte_score = 55
+        else:
+            dte_score = 40
+        score_components.append(dte_score)
 
-    thesis = InvestmentThesis(
-        bull_case=bull_case[:5],
-        bear_case=bear_case[:5],
-        key_catalysts=[
-            "Next earnings report",
-            "Product pipeline updates",
-            "Macroeconomic environment"
-        ],
-        key_risks=[
-            "Market volatility and sector rotation",
-            "Competition and technology disruption",
-            "Regulatory changes"
-        ],
-        recent_developments=[
-            f"Latest price: ${quote.price:.2f} ({quote.change_percent:+.2f}%) [Source: Market Data]"
-        ],
-        watch_items=[
-            "Quarterly earnings results",
-            "Revenue growth trajectory",
-            "Margin expansion/contraction",
-            "Competitive developments"
-        ]
+    # 2. Current Ratio (higher is better)
+    cr = fundamentals.current_ratio
+    if cr is not None:
+        if cr > 2.0:
+            cr_score = 95
+        elif cr > 1.5:
+            cr_score = 85
+        elif cr > 1.0:
+            cr_score = 70
+        elif cr > 0.8:
+            cr_score = 55
+        else:
+            cr_score = 40
+        score_components.append(cr_score)
+
+    # 3. Free Cash Flow positive
+    fcf = fundamentals.free_cash_flow
+    if fcf is not None:
+        fcf_score = 90 if fcf > 0 else 30
+        score_components.append(fcf_score)
+
+    # 4. FCF Margin
+    fcf_margin = fundamentals.fcf_margin
+    if fcf_margin is not None:
+        if fcf_margin > 20:
+            margin_score = 95
+        elif fcf_margin > 10:
+            margin_score = 85
+        elif fcf_margin > 0:
+            margin_score = 65
+        else:
+            margin_score = 40
+        score_components.append(margin_score)
+
+    # 5. ROE
+    roe = fundamentals.roe
+    if roe is not None:
+        if roe > 25:
+            roe_score = 95
+        elif roe > 15:
+            roe_score = 85
+        elif roe > 10:
+            roe_score = 70
+        elif roe > 0:
+            roe_score = 55
+        else:
+            roe_score = 35
+        score_components.append(roe_score)
+
+    # 6. Net Margin
+    nm = fundamentals.net_margin
+    if nm is not None:
+        if nm > 25:
+            nm_score = 95
+        elif nm > 15:
+            nm_score = 85
+        elif nm > 5:
+            nm_score = 70
+        elif nm > 0:
+            nm_score = 55
+        else:
+            nm_score = 35
+        score_components.append(nm_score)
+
+    # Average
+    score = int(_clamp(np.mean(score_components))) if score_components else 50
+    label, color = _get_score_label(score)
+
+    # Build explanation
+    explanations = []
+    if dte is not None:
+        explanations.append(f"Debt-to-equity of {dte:.2f}")
+    if cr is not None:
+        explanations.append(f"current ratio of {cr:.2f}")
+    if fcf is not None:
+        explanations.append(f"free cash flow of ${fcf/1e9:.1f}B")
+    if nm is not None:
+        explanations.append(f"net margin of {nm:.1f}%")
+
+    explanation = f"Financial health assessed from: {', '.join(explanations)}."
+
+    return HealthSubScore(
+        name="Financial Health",
+        score=score,
+        label=label,
+        color=color,
+        explanation=explanation,
+        metrics={
+            'debt_to_equity': dte,
+            'current_ratio': cr,
+            'free_cash_flow': fcf,
+            'fcf_margin': fcf_margin,
+            'roe': roe,
+            'net_margin': nm,
+        }
     )
 
-    sections = [
-        ResearchSection(
-            title="Business Overview",
-            content=f"{fundamentals.company_name} operates in the {fundamentals.sector} sector, {fundamentals.industry} industry. The company generates revenue primarily through its core business operations. Current market capitalization is ${fundamentals.market_cap/1e9:.1f}B." if fundamentals.market_cap else "Market cap data unavailable.",
-            sources=["Company Profile", "Market Data"]
-        ),
-        ResearchSection(
-            title="Financial Health Deep Dive",
-            content=f"The company shows {'strong' if fundamentals.free_cash_flow and fundamentals.free_cash_flow > 0 else 'weak'} free cash flow generation. Net margin stands at {fundamentals.net_margin:.1f}% with ROE of {fundamentals.roe:.1f}%. Debt-to-equity ratio is {fundamentals.debt_to_equity:.2f}." if fundamentals.net_margin and fundamentals.roe and fundamentals.debt_to_equity else "Key financial metrics unavailable.",
-            sources=["Financial Statements", "Balance Sheet", "Cash Flow"]
-        ),
-        ResearchSection(
-            title="Growth Analysis",
-            content=f"Revenue growth YoY: {fundamentals.revenue_growth_yoy:.1f}%. EPS growth YoY: {fundamentals.eps_growth_yoy:.1f}%. The company's growth profile is {'accelerating' if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 15 else 'moderate' if fundamentals.revenue_growth_yoy and fundamentals.revenue_growth_yoy > 5 else 'slowing'}." if fundamentals.revenue_growth_yoy else "Growth data unavailable.",
-            sources=["Income Statement", "Analyst Estimates"]
-        ),
-        ResearchSection(
-            title="Valuation Assessment",
-            content=f"Current P/E: {fundamentals.pe_ratio:.1f}, Forward P/E: {fundamentals.forward_pe:.1f}, PEG: {fundamentals.peg_ratio:.1f}, EV/EBITDA: {fundamentals.ev_to_ebitda:.1f}. Valuation appears {'expensive' if fundamentals.pe_ratio and fundamentals.pe_ratio > 30 else 'reasonable' if fundamentals.pe_ratio and fundamentals.pe_ratio < 20 else 'cheap'} relative to historical norms." if fundamentals.pe_ratio else "Valuation data unavailable.",
-            sources=["Market Data", "Analyst Estimates"]
-        ),
-        ResearchSection(
-            title="Competitive Position",
-            content=f"Operates in {fundamentals.industry} with {'strong' if fundamentals.net_margin and fundamentals.net_margin > 20 else 'moderate'} profitability. Market position assessment requires deeper competitive analysis.",
-            sources=["Industry Reports"]
-        ),
-        ResearchSection(
-            title="Risk Factors",
-            content=f"Key risks include market volatility (Beta: {fundamentals.get('beta', 'N/A')}), sector cyclicality, and execution risk. Short interest at {fundamentals.get('short_percent', 'N/A')}% of float.",
-            sources=["Market Data", "Risk Metrics"]
-        ),
-    ]
 
-    return ResearchReport(
-        symbol=symbol.upper(),
-        company_name=fundamentals.company_name,
-        thesis=thesis,
-        sections=sections,
-        generated_at=datetime.now(),
+def _calculate_growth(fundamentals) -> HealthSubScore:
+    """Calculate Growth score from revenue and earnings growth."""
+    score_components = []
+
+    # Revenue growth YoY
+    rg = fundamentals.revenue_growth_yoy
+    if rg is not None:
+        if rg > 30:
+            rg_score = 95
+        elif rg > 20:
+            rg_score = 88
+        elif rg > 10:
+            rg_score = 78
+        elif rg > 5:
+            rg_score = 65
+        elif rg > 0:
+            rg_score = 55
+        else:
+            rg_score = 35
+        score_components.append(rg_score)
+
+    # EPS growth YoY
+    eg = fundamentals.eps_growth_yoy
+    if eg is not None:
+        if eg > 40:
+            eg_score = 95
+        elif eg > 25:
+            eg_score = 88
+        elif eg > 15:
+            eg_score = 78
+        elif eg > 5:
+            eg_score = 65
+        elif eg > 0:
+            eg_score = 55
+        else:
+            eg_score = 35
+        score_components.append(eg_score)
+
+    # Net income growth (estimated from revenue + margin)
+    if rg is not None and eg is not None:
+        avg_growth = (rg + eg) / 2
+        if avg_growth > 25:
+            growth_score = 90
+        elif avg_growth > 15:
+            growth_score = 80
+        elif avg_growth > 5:
+            growth_score = 65
+        elif avg_growth > 0:
+            growth_score = 55
+        else:
+            growth_score = 35
+        score_components.append(growth_score)
+
+    score = int(_clamp(np.mean(score_components))) if score_components else 50
+    label, color = _get_score_label(score)
+
+    explanations = []
+    if rg is not None:
+        explanations.append(f"revenue growth of {rg:+.1f}% YoY")
+    if eg is not None:
+        explanations.append(f"EPS growth of {eg:+.1f}% YoY")
+
+    explanation = f"Growth assessed from: {', '.join(explanations)}." if explanations else "Growth data unavailable."
+
+    return HealthSubScore(
+        name="Growth",
+        score=score,
+        label=label,
+        color=color,
+        explanation=explanation,
+        metrics={
+            'revenue_growth': rg,
+            'eps_growth': eg,
+        }
     )
 
 
-async def generate_research_report(symbol: str) -> ResearchReport:
-    """Main entry point for generating research report using local rule-based synthesis."""
-    logger.info(f"Generating research report for {symbol}")
+def _calculate_momentum(quote, hist_data) -> HealthSubScore:
+    """Calculate Momentum score from price action."""
+    score_components = []
 
+    # 1. Recent returns (1M)
+    if hist_data and len(hist_data.data) > 1:
+        prices = [p.close for p in hist_data.data]
+        if len(prices) >= 2:
+            # 1M return approx (20 trading days)
+            recent_return = (prices[-1] - prices[0]) / prices[0] * 100
+            if recent_return > 15:
+                ret_score = 90
+            elif recent_return > 5:
+                ret_score = 80
+            elif recent_return > 0:
+                ret_score = 70
+            elif recent_return > -5:
+                ret_score = 55
+            elif recent_return > -15:
+                ret_score = 40
+            else:
+                ret_score = 25
+            score_components.append(ret_score)
+
+            # Volatility (lower is better for momentum stability)
+            if len(prices) >= 5:
+                returns = np.diff(prices) / prices[:-1]
+                volatility = np.std(returns) * np.sqrt(252) * 100
+                if volatility < 20:
+                    vol_score = 85
+                elif volatility < 40:
+                    vol_score = 70
+                elif volatility < 60:
+                    vol_score = 55
+                else:
+                    vol_score = 40
+                score_components.append(vol_score)
+
+    # 2. Position relative to 52-week range
+    if quote.price > 0 and quote.year_high > 0 and quote.year_low > 0:
+        range_position = (quote.price - quote.year_low) / (quote.year_high - quote.year_low)
+        if range_position > 0.8:
+            pos_score = 90
+        elif range_position > 0.6:
+            pos_score = 80
+        elif range_position > 0.4:
+            pos_score = 65
+        elif range_position > 0.2:
+            pos_score = 50
+        else:
+            pos_score = 35
+        score_components.append(pos_score)
+
+    # 3. Day change direction
+    if quote.change_percent is not None:
+        if quote.change_percent > 2:
+            day_score = 80
+        elif quote.change_percent > 0:
+            day_score = 70
+        elif quote.change_percent > -2:
+            day_score = 55
+        else:
+            day_score = 45
+        score_components.append(day_score)
+
+    score = int(_clamp(np.mean(score_components))) if score_components else 50
+    label, color = _get_score_label(score)
+
+    explanation = f"Momentum assessed from recent price action, volatility, and position in 52-week range."
+
+    return HealthSubScore(
+        name="Momentum",
+        score=score,
+        label=label,
+        color=color,
+        explanation=explanation,
+        metrics={
+            'recent_return': recent_return if 'recent_return' in locals() else None,
+            'range_position': range_position if 'range_position' in locals() else None,
+            'volatility': volatility if 'volatility' in locals() else None,
+        }
+    )
+
+
+def _calculate_valuation(fundamentals, quote) -> HealthSubScore:
+    """Calculate Valuation score from valuation ratios."""
+    score_components = []
+
+    # P/E ratio (lower is better relative to growth)
+    pe = fundamentals.pe_ratio or quote.pe_ratio
+    if pe is not None and pe > 0:
+        # Compare to typical "fair" PE of 15-25
+        if pe < 15:
+            pe_score = 90
+        elif pe < 25:
+            pe_score = 80
+        elif pe < 35:
+            pe_score = 65
+        elif pe < 50:
+            pe_score = 50
+        else:
+            pe_score = 35
+        score_components.append(pe_score)
+
+    # PEG ratio (P/E / growth)
+    peg = fundamentals.peg_ratio
+    if peg is not None and peg > 0:
+        if peg < 1:
+            peg_score = 90
+        elif peg < 2:
+            peg_score = 75
+        elif peg < 3:
+            peg_score = 60
+        else:
+            peg_score = 40
+        score_components.append(peg_score)
+
+    # EV/EBITDA
+    ev_ebitda = fundamentals.ev_to_ebitda
+    if ev_ebitda is not None and ev_ebitda > 0:
+        if ev_ebitda < 10:
+            ev_score = 90
+        elif ev_ebitda < 15:
+            ev_score = 78
+        elif ev_ebitda < 20:
+            ev_score = 65
+        elif ev_ebitda < 30:
+            ev_score = 50
+        else:
+            ev_score = 35
+        score_components.append(ev_score)
+
+    # P/S ratio
+    ps = fundamentals.price_to_sales
+    if ps is not None and ps > 0:
+        if ps < 2:
+            ps_score = 85
+        elif ps < 5:
+            ps_score = 70
+        elif ps < 10:
+            ps_score = 55
+        else:
+            ps_score = 40
+        score_components.append(ps_score)
+
+    score = int(_clamp(np.mean(score_components))) if score_components else 50
+    label, color = _get_score_label(score)
+
+    explanations = []
+    if pe is not None:
+        explanations.append(f"P/E of {pe:.1f}")
+    if peg is not None:
+        explanations.append(f"PEG of {peg:.1f}")
+    if ev_ebitda is not None:
+        explanations.append(f"EV/EBITDA of {ev_ebitda:.1f}")
+
+    explanation = f"Valuation assessed from: {', '.join(explanations)}." if explanations else "Valuation data unavailable."
+
+    return HealthSubScore(
+        name="Valuation",
+        score=score,
+        label=label,
+        color=color,
+        explanation=explanation,
+        metrics={
+            'pe_ratio': pe,
+            'peg_ratio': peg,
+            'ev_to_ebitda': ev_ebitda,
+            'price_to_sales': ps,
+        }
+    )
+
+
+def _calculate_sentiment(news_response) -> HealthSubScore:
+    """Calculate Sentiment score from news sentiment."""
+    if news_response and news_response.article_count > 0:
+        sentiment_score = news_response.sentiment_score  # -1 to 1
+
+        # Map to 0-100
+        score = int(_clamp((sentiment_score + 1) * 50))
+
+        # Analyst rating bonus
+        label, color = _get_score_label(score)
+
+        explanation = f"Based on {news_response.article_count} recent news articles. Overall sentiment: {news_response.overall_sentiment} (score: {sentiment_score:.2f})."
+
+        return HealthSubScore(
+            name="Market Sentiment",
+            score=score,
+            label=label,
+            color=color,
+            explanation=explanation,
+            metrics={
+                'sentiment_score': sentiment_score,
+                'article_count': news_response.article_count,
+                'overall': news_response.overall_sentiment,
+            }
+        )
+    else:
+        return HealthSubScore(
+            name="Market Sentiment",
+            score=50,
+            label="Fair",
+            color="yellow",
+            explanation="Insufficient news data to assess sentiment.",
+            metrics={}
+        )
+
+
+def _calculate_risk(quote, stats) -> HealthSubScore:
+    """Calculate Risk score (lower risk = higher score)."""
+    score_components = []
+
+    # Beta (closer to 1 is moderate risk)
+    beta = stats.get('beta')
+    if beta is not None:
+        # Score: 1.0 beta = 75, 0.5 or 1.5 = 65, >2 or <0.2 = 35
+        if 0.8 <= beta <= 1.2:
+            beta_score = 80
+        elif 0.5 <= beta <= 1.5:
+            beta_score = 70
+        elif 0.2 <= beta <= 2.0:
+            beta_score = 55
+        else:
+            beta_score = 35
+        score_components.append(beta_score)
+
+    # Short interest (lower is better)
+    short_pct = stats.get('short_percent')
+    if short_pct is not None:
+        if short_pct < 5:
+            short_score = 85
+        elif short_pct < 10:
+            short_score = 70
+        elif short_pct < 20:
+            short_score = 55
+        else:
+            short_score = 35
+        score_components.append(short_score)
+
+    # Volatility (from price)
+    if quote.price > 0 and quote.year_high > 0 and quote.year_low > 0:
+        annual_vol_proxy = (quote.year_high - quote.year_low) / quote.year_low * 100
+        if annual_vol_proxy < 30:
+            vol_score = 85
+        elif annual_vol_proxy < 50:
+            vol_score = 70
+        elif annual_vol_proxy < 80:
+            vol_score = 55
+        else:
+            vol_score = 35
+        score_components.append(vol_score)
+
+    score = int(_clamp(np.mean(score_components))) if score_components else 50
+    label, color = _get_score_label(score)
+
+    explanations = []
+    if beta is not None:
+        explanations.append(f"beta of {beta:.2f}")
+    if short_pct is not None:
+        explanations.append(f"short interest of {short_pct:.1f}%")
+
+    explanation = f"Risk assessed from: {', '.join(explanations)}." if explanations else "Risk data unavailable."
+
+    return HealthSubScore(
+        name="Risk",
+        score=score,
+        label=label,
+        color=color,
+        explanation=explanation,
+        metrics={
+            'beta': beta,
+            'short_percentage': short_pct,
+        }
+    )
+
+
+async def calculate_health_score(symbol: str) -> HealthScoreResponse:
+    """Calculate comprehensive health score for a stock."""
     try:
-        # Fetch all data
+        # Fetch all data in parallel
         quote = await get_quote(symbol)
         fundamentals = await get_fundamentals(symbol)
         stats = await get_key_stats(symbol)
-        news = await get_news_with_sentiment(symbol, limit=20)
-        health = await calculate_health_score(symbol)
-        movement = await analyze_movement(symbol)
+        hist_data = await get_historical(symbol, TimeFrame.MONTH)
+        news_response = await get_news_with_sentiment(symbol, limit=20)
 
-        # Build context (for vector store)
-        context = _build_research_context(symbol, fundamentals, quote, stats, news, health, movement)
+        # Calculate sub-scores
+        financial_health = _calculate_financial_health(fundamentals)
+        growth = _calculate_growth(fundamentals)
+        momentum = _calculate_momentum(quote, hist_data)
+        valuation = _calculate_valuation(fundamentals, quote)
+        sentiment = _calculate_sentiment(news_response)
+        risk = _calculate_risk(quote, stats)
 
-        # Generate thesis and sections using local rule-based synthesis
-        thesis = _generate_investment_thesis(symbol, fundamentals, quote, stats, news, health, movement)
-        sections = _generate_detailed_sections(symbol, fundamentals, quote, stats, news, health, movement)
+        sub_scores = [financial_health, growth, momentum, valuation, sentiment, risk]
 
-        report = ResearchReport(
+        # Calculate weighted overall score
+        weights = {
+            'Financial Health': 0.30,
+            'Growth': 0.20,
+            'Momentum': 0.15,
+            'Valuation': 0.15,
+            'Market Sentiment': 0.10,
+            'Risk': 0.10,
+        }
+
+        overall = sum(
+            s.score * weights[s.name]
+            for s in sub_scores
+        )
+        overall = int(_clamp(overall))
+        overall_label, overall_color = _get_score_label(overall)
+
+        # Estimate percentile (simplified - in production would compare to universe)
+        percentile = int(min(99, overall + 10))
+
+        return HealthScoreResponse(
             symbol=symbol.upper(),
-            company_name=fundamentals.company_name,
-            thesis=thesis,
-            sections=sections,
-            generated_at=datetime.now(),
+            overall_score=overall,
+            overall_label=overall_label,
+            overall_color=overall_color,
+            sub_scores=sub_scores,
+            percentile_rank=percentile,
+            calculated_at=datetime.now(),
         )
 
-        # Store documents in vector store for future retrieval
-        docs_to_store = [
-            {
-                'id': f"{symbol}_fundamentals_{datetime.now().isoformat()}",
-                'type': 'fundamentals',
-                'title': f'{symbol} Financial Fundamentals',
-                'source': 'Yahoo Finance',
-                'content': context,
-                'date': datetime.now().isoformat(),
-            }
-        ]
-        for article in news.articles[:10]:
-            docs_to_store.append({
-                'id': f"{symbol}_news_{article.id}",
-                'type': 'news',
-                'title': article.title,
-                'source': article.source,
-                'content': f"{article.title}. {article.summary}",
-                'date': article.published_at.isoformat(),
-                'url': article.url,
-            })
-
-        store_financial_documents(symbol, docs_to_store)
-
-        return report
-
     except Exception as e:
-        logger.error(f"Error generating research report for {symbol}: {e}")
+        logger.error(f"Error calculating health score for {symbol}: {e}")
         raise
-
-
-async def get_evidence_documents(symbol: str) -> List[SourceDocument]:
-    """Get source documents for evidence tab."""
-    from app.ml.vector_store import vector_store
-
-    docs = vector_store.search_by_symbol(symbol, "", n_results=20)
-
-    evidence = []
-    for d in docs:
-        evidence.append(SourceDocument(
-            id=d.get('id', ''),
-            type=d['metadata'].get('type', 'unknown'),
-            title=d['metadata'].get('title', ''),
-            source=d['metadata'].get('source', ''),
-            date=datetime.fromisoformat(d['metadata'].get('date', datetime.now().isoformat())),
-            url=d['metadata'].get('url'),
-            content_preview=d['document'][:300] + "..." if len(d['document']) > 300 else d['document'],
-            relevance_score=1.0 - (d.get('distance', 0.5)) if d.get('distance') else 0.5,
-        ))
-
-    return evidence
