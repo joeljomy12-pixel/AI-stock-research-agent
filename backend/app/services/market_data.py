@@ -1,8 +1,8 @@
 import logging
+import os
 from typing import Optional, List, Dict, Any
 
-import pandas as pd
-import yfinance as yf
+import httpx
 from cachetools import TTLCache
 
 from app.models.schemas import QuoteData, PricePoint, HistoricalData, TimeFrame
@@ -15,32 +15,54 @@ history_cache = TTLCache(maxsize=100, ttl=300)
 stats_cache = TTLCache(maxsize=100, ttl=300)
 
 
-def _safe_get(info: dict, key: str, default=None):
+def _get_fmp_key():
+    """
+    Gets the FMP API key from your Render environment variables.
+    """
+    key = os.getenv("FMP_API_KEY")
+
+    if not key:
+        raise ValueError(
+            "FMP_API_KEY is missing. Add FMP_API_KEY to your Render "
+            "environment variables."
+        )
+
+    return key
+
+
+async def _fmp_get(endpoint: str, params: Dict[str, Any]):
+    """
+    Make a request to Financial Modeling Prep.
+    """
+    api_key = _get_fmp_key()
+
+    params = dict(params)
+    params["apikey"] = api_key
+
+    url = f"https://financialmodelingprep.com/api/v3/{endpoint}"
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(url, params=params)
+
+    if response.status_code != 200:
+        raise ValueError(
+            f"FMP request failed with HTTP {response.status_code}"
+        )
+
     try:
-        value = info.get(key, default)
-
-        if value is None:
-            return default
-
-        if isinstance(value, float) and pd.isna(value):
-            return default
-
-        return value
+        data = response.json()
     except Exception:
-        return default
+        raise ValueError("FMP returned an invalid response.")
 
+    if isinstance(data, dict) and data.get("Error Message"):
+        raise ValueError(str(data["Error Message"]))
 
-def _get_ticker(symbol: str):
-    return yf.Ticker(symbol.upper())
+    return data
 
 
 async def get_quote(symbol: str) -> QuoteData:
     """
-    Get current stock quote.
-
-    Yahoo Finance can return HTTP 429 when rate-limited.
-    This function converts those failures into a clean error instead
-    of allowing a JSON parsing error to reach the frontend.
+    Get current quote from Financial Modeling Prep.
     """
 
     symbol = symbol.upper().strip()
@@ -50,102 +72,80 @@ async def get_quote(symbol: str) -> QuoteData:
         return quote_cache[cache_key]
 
     try:
-        ticker = _get_ticker(symbol)
+        data = await _fmp_get(
+            f"quote/{symbol}",
+            {}
+        )
 
-        # Yahoo's ticker.info endpoint is the part most likely to
-        # receive a 429 response.
-        info = ticker.info
-
-        if not info:
+        if not data or not isinstance(data, list):
             raise ValueError(
-                f"Unable to fetch quote data for {symbol}. "
-                "Yahoo Finance returned no data."
+                f"No quote data found for {symbol}."
             )
 
-        price = _safe_get(info, "regularMarketPrice")
+        item = data[0]
 
-        # Some Yahoo responses don't contain regularMarketPrice.
-        # Try currentPrice as a fallback.
-        if price is None:
-            price = _safe_get(info, "currentPrice")
+        price = item.get("price")
 
         if price is None:
             raise ValueError(
-                f"Unable to fetch quote data for {symbol}. "
-                "Yahoo Finance did not return a current price."
+                f"FMP did not return a price for {symbol}."
             )
+
+        change = item.get("change") or 0
+        change_percent = item.get("changesPercentage") or 0
 
         quote = QuoteData(
             symbol=symbol,
-            name=_safe_get(info, "longName", symbol),
-            sector=_safe_get(info, "sector"),
-            industry=_safe_get(info, "industry"),
+
+            name=item.get("name") or symbol,
+
+            sector=None,
+            industry=None,
 
             price=float(price),
 
-            change=float(
-                _safe_get(info, "regularMarketChange", 0) or 0
-            ),
+            change=float(change),
 
-            change_percent=float(
-                _safe_get(info, "regularMarketChangePercent", 0) or 0
-            ),
+            change_percent=float(change_percent),
 
-            volume=int(
-                _safe_get(info, "regularMarketVolume", 0) or 0
-            ),
+            volume=int(item.get("volume") or 0),
 
-            avg_volume=int(
-                _safe_get(info, "averageVolume", 0) or 0
-            ),
+            avg_volume=0,
 
-            market_cap=_safe_get(info, "marketCap"),
+            market_cap=None,
 
             day_high=float(
-                _safe_get(info, "regularMarketDayHigh", price) or price
+                item.get("dayHigh") or price
             ),
 
             day_low=float(
-                _safe_get(info, "regularMarketDayLow", price) or price
+                item.get("dayLow") or price
             ),
 
             year_high=float(
-                _safe_get(info, "fiftyTwoWeekHigh", price) or price
+                item.get("yearHigh") or price
             ),
 
             year_low=float(
-                _safe_get(info, "fiftyTwoWeekLow", price) or price
+                item.get("yearLow") or price
             ),
 
-            pe_ratio=_safe_get(info, "trailingPE"),
+            pe_ratio=item.get("pe"),
 
-            dividend_yield=_safe_get(info, "dividendYield"),
+            dividend_yield=None,
         )
 
         quote_cache[cache_key] = quote
+
         return quote
 
     except Exception as e:
-        error_text = str(e).lower()
-
-        if "429" in error_text or "too many requests" in error_text:
-            logger.error(
-                f"Yahoo Finance rate limit reached for {symbol}"
-            )
-
-            raise ValueError(
-                f"Unable to fetch quote data for {symbol}. "
-                "Yahoo Finance is temporarily rate-limiting requests. "
-                "Please try again shortly."
-            )
-
         logger.error(
-            f"Error fetching quote for {symbol}: {e}"
+            f"Error fetching FMP quote for {symbol}: {e}"
         )
 
         raise ValueError(
-            f"Unable to fetch quote data for {symbol}. "
-            "Yahoo Finance may be temporarily unavailable."
+            f"Unable to fetch quote data for {symbol}: {e}"
         )
 
 
@@ -156,74 +156,83 @@ async def get_historical(
 ) -> HistoricalData:
 
     symbol = symbol.upper().strip()
-    cache_key = f"hist_{symbol}_{timeframe.value}"
+
+    cache_key = (
+        f"hist_{symbol}_{timeframe.value}"
+    )
 
     if cache_key in history_cache:
         return history_cache[cache_key]
 
     period_map = {
-        TimeFrame.DAY: "1d",
-        TimeFrame.WEEK: "5d",
-        TimeFrame.MONTH: "1mo",
-        TimeFrame.THREE_MONTHS: "3mo",
-        TimeFrame.YEAR: "1y",
+        TimeFrame.DAY: 5,
+        TimeFrame.WEEK: 10,
+        TimeFrame.MONTH: 40,
+        TimeFrame.THREE_MONTHS: 100,
+        TimeFrame.YEAR: 370,
     }
 
-    interval_map = {
-        "1d": "5m",
-        "5d": "15m",
-        "1mo": "1d",
-        "3mo": "1d",
-        "1y": "1d",
-    }
-
-    yf_period = period or period_map.get(timeframe, "1mo")
-    interval = interval_map.get(yf_period, "1d")
+    days = period_map.get(
+        timeframe,
+        40
+    )
 
     try:
-        ticker = _get_ticker(symbol)
-
-        hist = ticker.history(
-            period=yf_period,
-            interval=interval,
-            auto_adjust=False,
-            actions=False,
+        data = await _fmp_get(
+            f"historical-price-full/{symbol}",
+            {
+                "timeseries": days
+            }
         )
 
-        if hist is None or hist.empty:
+        historical = data.get("historical", [])
+
+        if not historical:
             raise ValueError(
-                f"No historical data available for {symbol}."
+                f"No historical data found for {symbol}."
             )
+
+        historical.reverse()
 
         data_points = []
 
-        for idx, row in hist.iterrows():
-            try:
-                timestamp = (
-                    idx.to_pydatetime()
-                    if hasattr(idx, "to_pydatetime")
-                    else idx
-                )
+        for row in historical:
 
+            try:
                 data_points.append(
                     PricePoint(
-                        timestamp=timestamp,
-                        open=float(row["Open"]),
-                        high=float(row["High"]),
-                        low=float(row["Low"]),
-                        close=float(row["Close"]),
-                        volume=int(row["Volume"] or 0),
+                        timestamp=row["date"],
+
+                        open=float(
+                            row.get("open") or 0
+                        ),
+
+                        high=float(
+                            row.get("high") or 0
+                        ),
+
+                        low=float(
+                            row.get("low") or 0
+                        ),
+
+                        close=float(
+                            row.get("close") or 0
+                        ),
+
+                        volume=int(
+                            row.get("volume") or 0
+                        ),
                     )
                 )
+
             except Exception as row_error:
                 logger.warning(
-                    f"Skipping invalid historical row for {symbol}: "
-                    f"{row_error}"
+                    f"Skipping historical row: {row_error}"
                 )
 
         if not data_points:
             raise ValueError(
-                f"No usable historical data available for {symbol}."
+                f"No usable historical data for {symbol}."
             )
 
         result = HistoricalData(
@@ -237,116 +246,107 @@ async def get_historical(
         return result
 
     except Exception as e:
-        error_text = str(e).lower()
-
-        if "429" in error_text or "too many requests" in error_text:
-            logger.error(
-                f"Yahoo Finance rate limit reached while fetching "
-                f"historical data for {symbol}"
-            )
-
-            raise ValueError(
-                f"Unable to fetch historical data for {symbol}. "
-                "Yahoo Finance is temporarily rate-limiting requests."
-            )
-
         logger.error(
             f"Error fetching historical data for {symbol}: {e}"
         )
 
         raise ValueError(
-            f"Unable to fetch historical data for {symbol}."
+            f"Unable to fetch historical data for {symbol}: {e}"
         )
 
 
-async def get_key_stats(symbol: str) -> Dict[str, Any]:
+async def get_key_stats(
+    symbol: str
+) -> Dict[str, Any]:
 
     symbol = symbol.upper().strip()
+
     cache_key = f"stats_{symbol}"
 
     if cache_key in stats_cache:
         return stats_cache[cache_key]
 
     try:
-        ticker = _get_ticker(symbol)
-        info = ticker.info
 
-        if not info:
+        data = await _fmp_get(
+            f"key-metrics-ttm/{symbol}",
+            {}
+        )
+
+        if not data:
             return {}
 
+        item = data[0] if isinstance(data, list) else data
+
         stats = {
-            "beta": _safe_get(info, "beta"),
-            "shares_outstanding": _safe_get(
-                info, "sharesOutstanding"
+            "beta": None,
+            "shares_outstanding": None,
+            "float_shares": None,
+            "short_ratio": None,
+            "short_percent": None,
+            "held_insiders": None,
+            "held_institutions": None,
+
+            "book_value": item.get(
+                "bookValuePerShareTTM"
             ),
-            "float_shares": _safe_get(
-                info, "floatShares"
+
+            "price_to_book": item.get(
+                "priceToBookRatioTTM"
             ),
-            "short_ratio": _safe_get(
-                info, "shortRatio"
+
+            "enterprise_value": item.get(
+                "enterpriseValueTTM"
             ),
-            "short_percent": _safe_get(
-                info, "shortPercentOfFloat"
+
+            "ev_to_revenue": item.get(
+                "evToSalesTTM"
             ),
-            "held_insiders": _safe_get(
-                info, "heldPercentInsiders"
+
+            "ev_to_ebitda": item.get(
+                "enterpriseValueOverEBITDATTM"
             ),
-            "held_institutions": _safe_get(
-                info, "heldPercentInstitutions"
+
+            "profit_margins": item.get(
+                "netProfitMarginTTM"
             ),
-            "book_value": _safe_get(
-                info, "bookValue"
+
+            "operating_margins": item.get(
+                "operatingProfitMarginTTM"
             ),
-            "price_to_book": _safe_get(
-                info, "priceToBook"
+
+            "return_on_equity": item.get(
+                "returnOnEquityTTM"
             ),
-            "enterprise_value": _safe_get(
-                info, "enterpriseValue"
+
+            "return_on_assets": item.get(
+                "returnOnAssetsTTM"
             ),
-            "ev_to_revenue": _safe_get(
-                info, "enterpriseToRevenue"
+
+            "revenue_growth": None,
+            "earnings_growth": None,
+
+            "current_ratio": item.get(
+                "currentRatioTTM"
             ),
-            "ev_to_ebitda": _safe_get(
-                info, "enterpriseToEbitda"
+
+            "quick_ratio": item.get(
+                "quickRatioTTM"
             ),
-            "profit_margins": _safe_get(
-                info, "profitMargins"
+
+            "debt_to_equity": item.get(
+                "debtToEquityTTM"
             ),
-            "operating_margins": _safe_get(
-                info, "operatingMargins"
+
+            "total_cash": None,
+            "total_debt": None,
+
+            "operating_cash_flow": item.get(
+                "operatingCashFlowTTM"
             ),
-            "return_on_equity": _safe_get(
-                info, "returnOnEquity"
-            ),
-            "return_on_assets": _safe_get(
-                info, "returnOnAssets"
-            ),
-            "revenue_growth": _safe_get(
-                info, "revenueGrowth"
-            ),
-            "earnings_growth": _safe_get(
-                info, "earningsGrowth"
-            ),
-            "current_ratio": _safe_get(
-                info, "currentRatio"
-            ),
-            "quick_ratio": _safe_get(
-                info, "quickRatio"
-            ),
-            "debt_to_equity": _safe_get(
-                info, "debtToEquity"
-            ),
-            "total_cash": _safe_get(
-                info, "totalCash"
-            ),
-            "total_debt": _safe_get(
-                info, "totalDebt"
-            ),
-            "operating_cash_flow": _safe_get(
-                info, "operatingCashflow"
-            ),
-            "free_cash_flow": _safe_get(
-                info, "freeCashflow"
+
+            "free_cash_flow": item.get(
+                "freeCashFlowTTM"
             ),
         }
 
@@ -355,74 +355,42 @@ async def get_key_stats(symbol: str) -> Dict[str, Any]:
         return stats
 
     except Exception as e:
+
         logger.error(
-            f"Error fetching key stats for {symbol}: {e}"
+            f"Error fetching stats for {symbol}: {e}"
         )
 
         return {}
 
 
 async def search_tickers(
-    query: str,
+    query: str
 ) -> List[Dict[str, str]]:
 
-    try:
-        query = query.strip()
+    # Keep search simple for now.
+    # The important part is that stock quote/historical data
+    # no longer depends on Yahoo Finance.
 
-        if not query:
-            return []
-
-        results = yf.Search(
-            query,
-            max_results=10,
-        )
-
-        tickers = []
-
-        for result in results.quotes:
-            tickers.append(
-                {
-                    "symbol": result.get("symbol", ""),
-                    "name": (
-                        result.get("longname")
-                        or result.get("shortname")
-                        or ""
-                    ),
-                    "exchange": result.get(
-                        "exchange", ""
-                    ),
-                    "type": result.get(
-                        "quoteType", ""
-                    ),
-                }
-            )
-
-        return tickers
-
-    except Exception as e:
-        logger.error(
-            f"Error searching tickers for {query}: {e}"
-        )
-
-        return []
+    return []
 
 
 async def get_multiple_quotes(
-    symbols: List[str],
+    symbols: List[str]
 ) -> Dict[str, QuoteData]:
 
     results = {}
 
     for symbol in symbols:
-        symbol = symbol.upper().strip()
-
-        if not symbol:
-            continue
 
         try:
-            results[symbol] = await get_quote(symbol)
+
+            symbol = symbol.upper().strip()
+
+            if symbol:
+                results[symbol] = await get_quote(symbol)
 
         except Exception as e:
+
             logger.warning(
                 f"Failed to get quote for {symbol}: {e}"
             )
