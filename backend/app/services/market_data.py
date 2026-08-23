@@ -1,8 +1,9 @@
 import yfinance as yf
 import pandas as pd
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, TypeVar
 from datetime import datetime, timedelta
 import logging
+import asyncio
 from cachetools import TTLCache
 
 from app.models.schemas import QuoteData, PricePoint, HistoricalData, TimeFrame
@@ -13,6 +14,35 @@ logger = logging.getLogger(__name__)
 # In-memory cache
 quote_cache = TTLCache(maxsize=100, ttl=settings.cache_ttl_quote)
 history_cache = TTLCache(maxsize=100, ttl=300)
+
+T = TypeVar('T')
+
+async def _retry_with_backoff(
+    func: Callable[..., T],
+    *args,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 10.0,
+    **kwargs
+) -> T:
+    """Retry async function with exponential backoff for rate limiting."""
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            # Check for rate limiting
+            if '429' in error_msg or 'too many requests' in error_msg or 'rate limit' in error_msg:
+                if attempt < max_retries - 1:
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
+                    await asyncio.sleep(delay)
+                    continue
+            # Non-rate-limit error or max retries reached
+            raise
+    raise last_exception
 
 
 def _get_ticker(symbol: str) -> yf.Ticker:
@@ -34,7 +64,7 @@ async def get_quote(symbol: str) -> QuoteData:
     if cache_key in quote_cache:
         return quote_cache[cache_key]
 
-    try:
+    async def _fetch():
         ticker = _get_ticker(symbol)
         info = ticker.info
 
@@ -63,6 +93,8 @@ async def get_quote(symbol: str) -> QuoteData:
         quote_cache[cache_key] = quote
         return quote
 
+    try:
+        return await _retry_with_backoff(_fetch)
     except Exception as e:
         logger.error(f"Error fetching quote for {symbol}: {e}")
         raise
@@ -78,7 +110,7 @@ async def get_historical(
     if cache_key in history_cache:
         return history_cache[cache_key]
 
-    try:
+    async def _fetch():
         ticker = _get_ticker(symbol)
 
         # Map timeframe to yfinance period
@@ -126,6 +158,8 @@ async def get_historical(
         history_cache[cache_key] = result
         return result
 
+    try:
+        return await _retry_with_backoff(_fetch)
     except Exception as e:
         logger.error(f"Error fetching historical for {symbol}: {e}")
         raise
@@ -137,7 +171,7 @@ async def get_key_stats(symbol: str) -> Dict[str, Any]:
     if cache_key in quote_cache:  # reuse quote cache
         return quote_cache[cache_key]
 
-    try:
+    async def _fetch():
         ticker = _get_ticker(symbol)
         info = ticker.info
 
@@ -172,6 +206,8 @@ async def get_key_stats(symbol: str) -> Dict[str, Any]:
         quote_cache[cache_key] = stats
         return stats
 
+    try:
+        return await _retry_with_backoff(_fetch)
     except Exception as e:
         logger.error(f"Error fetching key stats for {symbol}: {e}")
         return {}
