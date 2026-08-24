@@ -21,4 +21,3 @@ vaderSentiment==3.3.2
 # Utilities
 cachetools==5.3.3
 python-dateutil==2.9.0.post0
-ta-lib==0.6.4
