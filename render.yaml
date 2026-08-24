@@ -2,7 +2,7 @@ services:
   - type: web
     name: stock-intelligence-api
     env: docker
-    dockerfilePath: ./backend/Dockerfile
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
     region: oregon
