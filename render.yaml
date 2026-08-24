@@ -17,7 +17,7 @@ services:
       - key: CHROMA_PERSIST_DIR
         value: ./chroma_db
       - key: CORS_ORIGINS_STR
-        value: https://ai-stock-research-agent-7dixrl2ks-joeljomy12-1428s-projects.vercel.app
+        value: https://ai-stock-research-agent-6wvwq01ta-joeljomy12-1428s-projects.vercel.app
       - key: BACKEND_HOST
         value: 0.0.0.0
       - key: BACKEND_PORT
