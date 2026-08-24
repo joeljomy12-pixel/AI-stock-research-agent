@@ -1,8 +1,9 @@
 import yfinance as yf
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable, TypeVar
 from datetime import datetime, timedelta
 import logging
 import re
+import asyncio
 from cachetools import TTLCache
 
 from app.models.schemas import NewsArticle, NewsResponse, SentimentLabel
@@ -12,6 +13,41 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 news_cache = TTLCache(maxsize=50, ttl=settings.cache_ttl_news)
+
+T = TypeVar('T')
+
+async def _retry_with_backoff(
+    func: Callable[..., T],
+    *args,
+    max_retries: int = 5,
+    base_delay: float = 2.0,
+    max_delay: float = 30.0,
+    **kwargs
+) -> T:
+    """Retry async function with exponential backoff for rate limiting."""
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            is_rate_limit = (
+                '429' in error_msg or
+                'too many requests' in error_msg or
+                'rate limit' in error_msg or
+                'expecting value' in error_msg or
+                'json' in error_msg and 'decode' in error_msg or
+                'possibly delisted' in error_msg or
+                'no price data' in error_msg
+            )
+            if is_rate_limit and attempt < max_retries - 1:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
+                await asyncio.sleep(delay)
+                continue
+            raise
+    raise last_exception
 
 
 def _clean_text(text: str) -> str:
@@ -30,7 +66,8 @@ def _clean_text(text: str) -> str:
 
 async def get_yahoo_news(symbol: str, limit: int = 20) -> List[Dict[str, Any]]:
     """Fetch news from Yahoo Finance."""
-    try:
+
+    async def _fetch():
         ticker = yf.Ticker(symbol.upper())
         news = ticker.news
 
@@ -87,6 +124,8 @@ async def get_yahoo_news(symbol: str, limit: int = 20) -> List[Dict[str, Any]]:
 
         return articles
 
+    try:
+        return await _retry_with_backoff(_fetch)
     except Exception as e:
         logger.error(f"Error fetching Yahoo news for {symbol}: {e}")
         return []

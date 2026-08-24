@@ -1,8 +1,9 @@
 import yfinance as yf
 import pandas as pd
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable, TypeVar
 from datetime import datetime
 import logging
+import asyncio
 from cachetools import TTLCache
 
 from app.models.schemas import FundamentalsData
@@ -11,6 +12,41 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 fundamentals_cache = TTLCache(maxsize=50, ttl=settings.cache_ttl_fundamentals)
+
+T = TypeVar('T')
+
+async def _retry_with_backoff(
+    func: Callable[..., T],
+    *args,
+    max_retries: int = 5,
+    base_delay: float = 2.0,
+    max_delay: float = 30.0,
+    **kwargs
+) -> T:
+    """Retry async function with exponential backoff for rate limiting."""
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            is_rate_limit = (
+                '429' in error_msg or
+                'too many requests' in error_msg or
+                'rate limit' in error_msg or
+                'expecting value' in error_msg or
+                'json' in error_msg and 'decode' in error_msg or
+                'possibly delisted' in error_msg or
+                'no price data' in error_msg
+            )
+            if is_rate_limit and attempt < max_retries - 1:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
+                await asyncio.sleep(delay)
+                continue
+            raise
+    raise last_exception
 
 
 def _safe_get(obj: Any, attr: str, default=None):
@@ -38,7 +74,7 @@ async def get_fundamentals(symbol: str) -> FundamentalsData:
     if cache_key in fundamentals_cache:
         return fundamentals_cache[cache_key]
 
-    try:
+    async def _fetch():
         ticker = yf.Ticker(symbol.upper())
         info = ticker.info
 
@@ -158,6 +194,8 @@ async def get_fundamentals(symbol: str) -> FundamentalsData:
         fundamentals_cache[cache_key] = fundamentals
         return fundamentals
 
+    try:
+        return await _retry_with_backoff(_fetch)
     except Exception as e:
         logger.error(f"Error fetching fundamentals for {symbol}: {e}")
         raise
@@ -165,7 +203,8 @@ async def get_fundamentals(symbol: str) -> FundamentalsData:
 
 async def get_quarterly_financials(symbol: str) -> Dict[str, List[Dict]]:
     """Get quarterly financial data for trend analysis."""
-    try:
+
+    async def _fetch():
         ticker = yf.Ticker(symbol.upper())
         financials = ticker.quarterly_financials
         balance_sheet = ticker.quarterly_balance_sheet
@@ -181,6 +220,9 @@ async def get_quarterly_financials(symbol: str) -> Dict[str, List[Dict]]:
             'balance_sheet': df_to_records(balance_sheet),
             'cash_flow': df_to_records(cashflow),
         }
+
+    try:
+        return await _retry_with_backoff(_fetch)
     except Exception as e:
         logger.error(f"Error fetching quarterly financials for {symbol}: {e}")
         return {'income_statement': [], 'balance_sheet': [], 'cash_flow': []}
