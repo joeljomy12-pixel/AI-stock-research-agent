@@ -15,8 +15,8 @@ COPY backend/requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY backend/app ./app
+# Copy entire backend directory (includes app/ and any config)
+COPY backend/ ./
 
 # Create chroma_db directory
 RUN mkdir -p chroma_db
