@@ -1,5 +1,5 @@
-from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional
+from fastapi import APIRouter, Query
+from typing import List, Optional, Any
 
 from app.services.market_data import get_quote, get_historical, get_key_stats, search_tickers, TimeFrame
 from app.services.financial_data import get_fundamentals
@@ -16,6 +16,14 @@ from app.models.schemas import (
 router = APIRouter(prefix="/stocks", tags=["stocks"])
 
 
+def _handle_error(e: Exception, status_code: int = 500) -> APIResponse:
+    """Handle errors and return consistent JSON error response."""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.error(f"API error: {e}")
+    return APIResponse(success=False, error=str(e))
+
+
 @router.get("/search", response_model=APIResponse)
 async def search_stocks(q: str = Query(..., min_length=1)):
     """Search for stock tickers."""
@@ -26,7 +34,7 @@ async def search_stocks(q: str = Query(..., min_length=1)):
             data=[SearchResult(**r) for r in results]
         )
     except Exception as e:
-        return APIResponse(success=False, error=str(e))
+        return _handle_error(e, 404)
 
 
 @router.get("/{symbol}/quote", response_model=APIResponse)
@@ -36,7 +44,7 @@ async def get_stock_quote(symbol: str):
         quote = await get_quote(symbol)
         return APIResponse(success=True, data=quote)
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return _handle_error(e, 404)
 
 
 @router.get("/{symbol}/historical", response_model=APIResponse)
@@ -49,7 +57,7 @@ async def get_stock_historical(
         hist = await get_historical(symbol, timeframe)
         return APIResponse(success=True, data=hist)
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return _handle_error(e, 404)
 
 
 @router.get("/{symbol}/fundamentals", response_model=APIResponse)
@@ -59,7 +67,7 @@ async def get_stock_fundamentals(symbol: str):
         fundamentals = await get_fundamentals(symbol)
         return APIResponse(success=True, data=fundamentals)
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return _handle_error(e, 404)
 
 
 @router.get("/{symbol}/key-stats", response_model=APIResponse)
@@ -69,7 +77,7 @@ async def get_stock_key_stats(symbol: str):
         stats = await get_key_stats(symbol)
         return APIResponse(success=True, data=stats)
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return _handle_error(e, 404)
 
 
 @router.get("/{symbol}/news", response_model=APIResponse)
@@ -79,7 +87,7 @@ async def get_stock_news(symbol: str, limit: int = Query(20, le=50)):
         news = await get_news_with_sentiment(symbol, limit)
         return APIResponse(success=True, data=news)
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return _handle_error(e, 404)
 
 
 @router.get("/{symbol}/health", response_model=APIResponse)
@@ -89,7 +97,7 @@ async def get_stock_health(symbol: str):
         health = await calculate_health_score(symbol)
         return APIResponse(success=True, data=health)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return _handle_error(e, 500)
 
 
 @router.get("/{symbol}/movement", response_model=APIResponse)
@@ -99,7 +107,7 @@ async def get_stock_movement(symbol: str):
         movement = await analyze_movement(symbol)
         return APIResponse(success=True, data=movement)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return _handle_error(e, 500)
 
 
 @router.get("/{symbol}/research", response_model=APIResponse)
@@ -109,7 +117,7 @@ async def get_stock_research(symbol: str):
         report = await generate_research_report(symbol)
         return APIResponse(success=True, data=report)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return _handle_error(e, 500)
 
 
 @router.get("/{symbol}/evidence", response_model=APIResponse)
@@ -119,7 +127,7 @@ async def get_stock_evidence(symbol: str):
         evidence = await get_evidence_documents(symbol)
         return APIResponse(success=True, data={"symbol": symbol.upper(), "documents": evidence, "total_count": len(evidence)})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return _handle_error(e, 500)
 
 
 @router.get("/market/news", response_model=APIResponse)
@@ -129,4 +137,4 @@ async def get_market_news_endpoint(limit: int = Query(30, le=50)):
         news = await get_market_news(limit)
         return APIResponse(success=True, data=news)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return _handle_error(e, 500)
