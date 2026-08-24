@@ -20,9 +20,9 @@ T = TypeVar('T')
 async def _retry_with_backoff(
     func: Callable[..., T],
     *args,
-    max_retries: int = 3,
-    base_delay: float = 1.0,
-    max_delay: float = 10.0,
+    max_retries: int = 5,
+    base_delay: float = 2.0,
+    max_delay: float = 30.0,
     **kwargs
 ) -> T:
     """Retry async function with exponential backoff for rate limiting."""
@@ -33,13 +33,21 @@ async def _retry_with_backoff(
         except Exception as e:
             last_exception = e
             error_msg = str(e).lower()
-            # Check for rate limiting
-            if '429' in error_msg or 'too many requests' in error_msg or 'rate limit' in error_msg:
-                if attempt < max_retries - 1:
-                    delay = min(base_delay * (2 ** attempt), max_delay)
-                    logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
-                    await asyncio.sleep(delay)
-                    continue
+            # Check for rate limiting - yfinance logs 429 but raises JSON decode error
+            is_rate_limit = (
+                '429' in error_msg or
+                'too many requests' in error_msg or
+                'rate limit' in error_msg or
+                'expecting value' in error_msg or
+                'json' in error_msg and 'decode' in error_msg or
+                'possibly delisted' in error_msg or
+                'no price data' in error_msg
+            )
+            if is_rate_limit and attempt < max_retries - 1:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
+                await asyncio.sleep(delay)
+                continue
             # Non-rate-limit error or max retries reached
             raise
     raise last_exception
