@@ -8,6 +8,12 @@ from cachetools import TTLCache
 
 from app.models.schemas import QuoteData, PricePoint, HistoricalData, TimeFrame
 from app.core.config import settings
+from app.services.fmp_service import (
+    get_quote_fmp,
+    get_historical_fmp,
+    get_fundamentals_fmp,
+    get_key_stats_fmp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +73,13 @@ def _safe_get(info: dict, key: str, default=None):
 
 
 async def get_quote(symbol: str) -> QuoteData:
-    """Get current quote data for a symbol."""
+    """Get current quote data for a symbol. Tries yfinance first, falls back to FMP."""
     cache_key = f"quote_{symbol.upper()}"
     if cache_key in quote_cache:
         return quote_cache[cache_key]
 
-    async def _fetch():
+    # Try yfinance first
+    async def _fetch_yf():
         ticker = _get_ticker(symbol)
         info = ticker.info
 
@@ -97,14 +104,22 @@ async def get_quote(symbol: str) -> QuoteData:
             pe_ratio=_safe_get(info, 'trailingPE'),
             dividend_yield=_safe_get(info, 'dividendYield'),
         )
-
-        quote_cache[cache_key] = quote
         return quote
 
     try:
-        return await _retry_with_backoff(_fetch)
+        quote = await _retry_with_backoff(_fetch_yf)
+        quote_cache[cache_key] = quote
+        return quote
     except Exception as e:
-        logger.error(f"Error fetching quote for {symbol}: {e}")
+        logger.warning(f"yfinance quote failed for {symbol}: {e}, trying FMP...")
+        # Fallback to FMP
+        try:
+            fmp_quote = await get_quote_fmp(symbol)
+            if fmp_quote:
+                quote_cache[cache_key] = fmp_quote
+                return fmp_quote
+        except Exception as fmp_e:
+            logger.error(f"FMP quote also failed for {symbol}: {fmp_e}")
         raise
 
 
@@ -113,12 +128,13 @@ async def get_historical(
     timeframe: TimeFrame = TimeFrame.MONTH,
     period: Optional[str] = None
 ) -> HistoricalData:
-    """Get historical price data."""
+    """Get historical price data. Tries yfinance first, falls back to FMP."""
     cache_key = f"hist_{symbol.upper()}_{timeframe.value}"
     if cache_key in history_cache:
         return history_cache[cache_key]
 
-    async def _fetch():
+    # Try yfinance first
+    async def _fetch_yf():
         ticker = _get_ticker(symbol)
 
         # Map timeframe to yfinance period
@@ -162,24 +178,33 @@ async def get_historical(
             timeframe=timeframe,
             data=data_points
         )
-
-        history_cache[cache_key] = result
         return result
 
     try:
-        return await _retry_with_backoff(_fetch)
+        result = await _retry_with_backoff(_fetch_yf)
+        history_cache[cache_key] = result
+        return result
     except Exception as e:
-        logger.error(f"Error fetching historical for {symbol}: {e}")
+        logger.warning(f"yfinance historical failed for {symbol}: {e}, trying FMP...")
+        # Fallback to FMP
+        try:
+            fmp_hist = await get_historical_fmp(symbol, timeframe)
+            if fmp_hist:
+                history_cache[cache_key] = fmp_hist
+                return fmp_hist
+        except Exception as fmp_e:
+            logger.error(f"FMP historical also failed for {symbol}: {fmp_e}")
         raise
 
 
 async def get_key_stats(symbol: str) -> Dict[str, Any]:
-    """Get key statistics for health scoring."""
+    """Get key statistics for health scoring. Tries yfinance first, falls back to FMP."""
     cache_key = f"stats_{symbol.upper()}"
     if cache_key in quote_cache:  # reuse quote cache
         return quote_cache[cache_key]
 
-    async def _fetch():
+    # Try yfinance first
+    async def _fetch_yf():
         ticker = _get_ticker(symbol)
         info = ticker.info
 
@@ -210,14 +235,22 @@ async def get_key_stats(symbol: str) -> Dict[str, Any]:
             'operating_cash_flow': _safe_get(info, 'operatingCashflow'),
             'free_cash_flow': _safe_get(info, 'freeCashflow'),
         }
-
-        quote_cache[cache_key] = stats
         return stats
 
     try:
-        return await _retry_with_backoff(_fetch)
+        stats = await _retry_with_backoff(_fetch_yf)
+        quote_cache[cache_key] = stats
+        return stats
     except Exception as e:
-        logger.error(f"Error fetching key stats for {symbol}: {e}")
+        logger.warning(f"yfinance key stats failed for {symbol}: {e}, trying FMP...")
+        # Fallback to FMP
+        try:
+            fmp_stats = await get_key_stats_fmp(symbol)
+            if fmp_stats:
+                quote_cache[cache_key] = fmp_stats
+                return fmp_stats
+        except Exception as fmp_e:
+            logger.error(f"FMP key stats also failed for {symbol}: {fmp_e}")
         return {}
 
 

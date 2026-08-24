@@ -8,6 +8,7 @@ from cachetools import TTLCache
 
 from app.models.schemas import FundamentalsData
 from app.core.config import settings
+from app.services.fmp_service import get_fundamentals_fmp
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +70,13 @@ def _safe_dict_get(d: dict, key: str, default=None):
 
 
 async def get_fundamentals(symbol: str) -> FundamentalsData:
-    """Get comprehensive fundamental data from yfinance."""
+    """Get comprehensive fundamental data. Tries yfinance first, falls back to FMP."""
     cache_key = f"fund_{symbol.upper()}"
     if cache_key in fundamentals_cache:
         return fundamentals_cache[cache_key]
 
-    async def _fetch():
+    # Try yfinance first
+    async def _fetch_yf():
         ticker = yf.Ticker(symbol.upper())
         info = ticker.info
 
@@ -195,10 +197,45 @@ async def get_fundamentals(symbol: str) -> FundamentalsData:
         return fundamentals
 
     try:
+        return await _retry_with_backoff(_fetch_yf)
+    except Exception as e:
+        logger.warning(f"yfinance fundamentals failed for {symbol}: {e}, trying FMP...")
+        # Fallback to FMP
+        try:
+            fmp_fund = await get_fundamentals_fmp(symbol)
+            if fmp_fund:
+                fundamentals_cache[cache_key] = fmp_fund
+                return fmp_fund
+        except Exception as fmp_e:
+            logger.error(f"FMP fundamentals also failed for {symbol}: {fmp_e}")
+        raise
+
+
+async def get_quarterly_financials(symbol: str) -> Dict[str, List[Dict]]:
+    """Get quarterly financial data for trend analysis."""
+
+    async def _fetch():
+        ticker = yf.Ticker(symbol.upper())
+        financials = ticker.quarterly_financials
+        balance_sheet = ticker.quarterly_balance_sheet
+        cashflow = ticker.quarterly_cashflow
+
+        def df_to_records(df: pd.DataFrame) -> List[Dict]:
+            if df.empty:
+                return []
+            return df.T.reset_index().rename(columns={'index': 'date'}).to_dict('records')
+
+        return {
+            'income_statement': df_to_records(financials),
+            'balance_sheet': df_to_records(balance_sheet),
+            'cash_flow': df_to_records(cashflow),
+        }
+
+    try:
         return await _retry_with_backoff(_fetch)
     except Exception as e:
-        logger.error(f"Error fetching fundamentals for {symbol}: {e}")
-        raise
+        logger.error(f"Error fetching quarterly financials for {symbol}: {e}")
+        return {'income_statement': [], 'balance_sheet': [], 'cash_flow': []}
 
 
 async def get_quarterly_financials(symbol: str) -> Dict[str, List[Dict]]:
