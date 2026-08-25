@@ -13,7 +13,8 @@ class Settings(BaseSettings):
     chroma_persist_dir: str = "./chroma_db"
 
     # CORS - parse comma-separated string
-    cors_origins_str: str = "http://localhost:3000"
+    # Fallback includes common Vercel preview URLs for auto-deploy compatibility
+    cors_origins_str: str = "http://localhost:3000,https://ai-stock-research-agent-6wvwq01ta-joeljomy12-1428s-projects.vercel.app,https://ai-stock-research-agent-gamma.vercel.app,https://ai-stock-research-agent-7dixrl2ks-joeljomy12-1428s-projects.vercel.app"
 
     @property
     def cors_origins(self) -> List[str]:
