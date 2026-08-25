@@ -74,6 +74,17 @@ async def health_check():
     return {"status": "healthy", "service": "stock-intelligence-api"}
 
 
+@app.get("/debug/env")
+async def debug_env():
+    from app.core.config import settings
+    return {
+        "fmp_api_key_set": bool(settings.fmp_api_key),
+        "fmp_api_key_length": len(settings.fmp_api_key) if settings.fmp_api_key else 0,
+        "fmp_api_key_prefix": settings.fmp_api_key[:4] + "..." if settings.fmp_api_key and len(settings.fmp_api_key) > 4 else settings.fmp_api_key,
+        "cors_origins": settings.cors_origins,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
