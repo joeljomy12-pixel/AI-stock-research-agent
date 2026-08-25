@@ -1,6 +1,5 @@
 from pydantic_settings import BaseSettings
 from typing import List
-import os
 
 
 class Settings(BaseSettings):
@@ -24,11 +23,11 @@ class Settings(BaseSettings):
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
 
-    # Cache TTL (seconds)
-    cache_ttl_quote: int = 60
-    cache_ttl_fundamentals: int = 900
-    cache_ttl_news: int = 300
-    cache_ttl_health: int = 600
+    # Cache TTL (seconds) - increased for Render free tier shared IP rate limits
+    cache_ttl_quote: int = 300
+    cache_ttl_fundamentals: int = 3600
+    cache_ttl_news: int = 600
+    cache_ttl_health: int = 1800
 
     class Config:
         env_file = ".env"

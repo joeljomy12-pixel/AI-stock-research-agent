@@ -26,16 +26,16 @@ T = TypeVar('T')
 async def _retry_with_backoff(
     func: Callable[..., T],
     *args,
-    max_retries: int = 2,
-    base_delay: float = 1.0,
-    max_delay: float = 4.0,
-    timeout: float = 15.0,
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+    max_delay: float = 8.0,
+    timeout: float = 20.0,
     **kwargs
 ) -> T:
     """Retry async function with exponential backoff for rate limiting.
 
-    Kept fast on purpose: with 3 data sources (yfinance -> FMP -> mock),
-    long retries just make requests hang. Worst case here is ~17s per call.
+    Increased for Render free tier: more retries, longer delays, longer timeout.
+    Worst case now ~44s per call but reduces mock fallback.
     """
     last_exception = None
     for attempt in range(max_retries):
