@@ -326,4 +326,4 @@ MIT License - feel free to use for hackathons, learning, or commercial projects.
 - **ChromaDB** for vector storage
 - **Recharts** for beautiful visualizations
 - **Tailwind CSS** for rapid UI development
-- **FastAPI** for high-performance Python APIs
+- **FastAPI** for high-performance Python APIs# Trigger Vercel rebuild
