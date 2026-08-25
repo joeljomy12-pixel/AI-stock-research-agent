@@ -19,19 +19,28 @@ T = TypeVar('T')
 async def _retry_with_backoff(
     func: Callable[..., T],
     *args,
-    max_retries: int = 5,
-    base_delay: float = 2.0,
-    max_delay: float = 30.0,
+    max_retries: int = 2,
+    base_delay: float = 1.0,
+    max_delay: float = 4.0,
+    timeout: float = 15.0,
     **kwargs
 ) -> T:
-    """Retry async function with exponential backoff for rate limiting."""
+    """Retry async function with exponential backoff for rate limiting.
+
+    Kept fast on purpose: with mock fallback,
+    long retries just make requests hang. Worst case here is ~17s per call.
+    """
     last_exception = None
     for attempt in range(max_retries):
         try:
-            return await func(*args, **kwargs)
+            return await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
+        except asyncio.TimeoutError as e:
+            last_exception = e
+            error_msg = 'timeout'
         except Exception as e:
             last_exception = e
             error_msg = str(e).lower()
+            # Check for rate limiting - yfinance logs 429 but raises JSON decode error
             is_rate_limit = (
                 '429' in error_msg or
                 'too many requests' in error_msg or
@@ -46,6 +55,7 @@ async def _retry_with_backoff(
                 logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
                 await asyncio.sleep(delay)
                 continue
+            # Non-rate-limit error or max retries reached
             raise
     raise last_exception
 
